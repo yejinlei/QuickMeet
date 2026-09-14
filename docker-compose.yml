@@ -1,0 +1,91 @@
+# QuickMeet Stage 1 — docker-compose
+#
+# 兼容性约束（Epic YEJ-89）：必须能在 docker-compose 1.29.2 下运行，
+# 因此本文件**不使用** compose 2.x / docker-compose-plugin 才有的语法：
+#   - 没有 deploy: 段（1.29.2 会直接拒绝）
+#   - 没有 YAML anchor / alias（v3.x 规范不支持）
+#   - 没有 extends: / develop: / secrets: / config:
+#   - 没有 include:、没有多行 build.contexts、没有 target:
+#   - 重启策略用服务级 restart:（v3 语法），不写在 deploy.restart_policy 里
+#   - build 用短语法，context 不越过仓库根目录
+#
+# 运行：
+#   docker-compose up -d --build        # 1.29.2 的 CLI，不是 docker compose
+#   docker-compose ps
+#   docker-compose logs -f qm-media
+#   docker-compose down
+
+version: "3.8"
+
+services:
+  # 媒体/编解码层：跑 VP8 / H.264 / Opus 收发兼容验证，并可起信令服务。
+  qm-media:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qm-media
+    restart: unless-stopped
+    # 媒体服务默认监听 8080（Epic 全局约束）。
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    # 只绑内网网段：容器网络固定映射到 192.168.0.0/24 的主机侧地址。
+    env_file:
+      - config/container.env
+    volumes:
+      - meeting-data:/opt/quickmeet/data
+      - meeting-logs:/opt/quickmeet/logs
+    networks:
+      - quickmeet
+    # 1.29.2 支持 healthcheck；这里探 8081（信令 HTTP 端口）。
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 信令服务：独立进程，与媒体层同网段，只做内网信令路由。
+  qm-signaling:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qm-signaling
+    restart: unless-stopped
+    depends_on:
+      - qm-media
+    ports:
+      - "8081:8081"
+    env_file:
+      - config/container.env
+    volumes:
+      - meeting-data:/opt/quickmeet/data:ro
+    networks:
+      - quickmeet
+    command:
+      - --bind
+      - 0.0.0.0
+      - --signal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  quickmeet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.0.0/24
+          gateway: 192.168.0.1
+
+volumes:
+  meeting-data:
+  meeting-logs:

@@ -1,0 +1,23 @@
+[package]
+name = "qm-signaling"
+description = "QuickMeet 信令层：内网信令路由（room / peer / offer / ICE candidate）+ 私有网段准入"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+qm-common = { path = "../qm-common" }
+http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+# hyper 只被 HTTP 适配层用到；核心路由（SignalRouter::route）保持无 HTTP 依赖，
+# 这样 cargo test 可以离线断言路由逻辑。默认开启 http 特性以提供可运行服务。
+hyper = { workspace = true }
+tokio = { workspace = true }

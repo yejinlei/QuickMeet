@@ -1,0 +1,26 @@
+{
+  "media": {
+    "port": 8080,
+    "signaling_port": 8081,
+    "max_participants": 64,
+    "idle_timeout_secs": 600
+  },
+  "network": {
+    "cidrs": ["192.168.0.0/24", "10.0.0.0/8"],
+    "bind_host": "192.168.0.10"
+  },
+  "logging": {
+    "level": "info,webrtc=debug,qm_media=trace",
+    "file_dir": "./logs",
+    "json": true
+  },
+  "storage": {
+    "data_dir": "./data/meetings",
+    "encrypted": false
+  },
+  "ai": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:3000/v1",
+    "timeout_ms": 30000
+  }
+}

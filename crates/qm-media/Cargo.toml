@@ -1,0 +1,37 @@
+[package]
+name = "qm-media"
+description = "QuickMeet 媒体/编解码层：统一 codec 封装 + VP8/H.264/Opus 可复现收发验证"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+qm-common = { path = "../qm-common" }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+# 可选的原生编解码实现（需要 C 工具链，默认关闭；本阶段只提供确定性纯 Rust 实现）
+opus = { version = "0.4", optional = true }
+openh264 = { version = "0.9", optional = true }
+vpx = { version = "0.3", optional = true }
+
+# webrtc-rs 0.17.1：双端 PeerConnection ICE/DTLS 互连验证（验收标准 2）。
+# Cargo 不允许 dev-dependency 标 optional，所以放在普通 dependencies 里，
+# 用 optional + `webrtc` feature 一起门控；默认构建不会拉取它。
+webrtc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[features]
+default = []
+native-opus = ["dep:opus"]
+native-h264 = ["dep:openh264"]
+native-vp8 = ["dep:vpx"]
+webrtc = ["dep:webrtc"]

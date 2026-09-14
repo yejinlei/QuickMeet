@@ -1,0 +1,81 @@
+# QuickMeet workspace — Stage 1 baseline (YEJ-90)
+#
+# 约束（继承 Epic YEJ-89 全局强制约束）：
+#   * MSRV 1.75：仅使用 crates.io 公共 crate，配合 Cargo 的
+#     `resolver.incompatible-rust-versions = "fallback"`（见 .cargo/config.toml）
+#     保证解析结果落在 rust-version <= 1.75 的版本上。
+#   * 无私有依赖：全部来自 crates.io。
+#   * 本地合规：仅监听内网地址，无公网 API 调用。
+[workspace]
+resolver = "2"
+members = [
+    "crates/qm-common",
+    "crates/qm-media",
+    "crates/qm-signaling",
+    "demos/qm-demo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/yejinlei/QuickMeet"
+
+[workspace.dependencies]
+# --- 核心 WebRTC ---
+webrtc = "=0.17.1"
+webrtc-media = "=0.17.1"
+rtp = "=0.17.1"
+sdp = "=0.17.1"
+
+# --- 异步运行时 / IO ---
+tokio = { version = "1.40.0", features = [
+    "macros", "rt-multi-thread", "net", "sync", "time", "fs", "io-util", "signal", "parking_lot",
+] }
+futures = "0.3.30"
+
+# 编解码：全部落在 workspace 内的 crates/qm-media（确定性纯 Rust 实现 + 可选原生特性），
+# 不依赖任何第三方编解码 crate，因此 `cargo build --release` 零外部工具链。
+
+# --- HTTP / JSON / 序列化 ---
+hyper = { version = "=0.14.28", features = ["server", "http1", "tcp"] }
+tower = { version = "=0.4.13", features = ["util", "timeout"] }
+http = "=0.2.12"
+serde = { version = "=1.0.204", features = ["derive"] }
+serde_json = "=1.0.120"
+
+# --- 日志 / 追踪 ---
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "local-time", "json"] }
+tracing-appender = "0.2.3"
+
+# --- 配置 / 错误 ---
+figment = { version = "=0.10.17", features = ["json", "toml", "env"] }
+thiserror = "=1.0.63"
+anyhow = "1.0.86"
+clap = { version = "4.5.8", features = ["derive"] }
+
+# --- 基础设施 ---
+bytes = "1.6.1"
+# rand 必须 <0.9：0.9 起 rand 使用 rand_core 0.9，与 rand_chacha 0.3（zeroize <1.9）冲突。
+rand = ">=0.8, <0.9"
+uuid = { version = "1.10.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+once_cell = "1.19.0"
+parking_lot = "0.12.3"
+regex = "1.10.5"
+
+# --- 测试 ---
+tokio-test = "0.4.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = false
+
+[profile.dev]
+incremental = true
+debug = 1

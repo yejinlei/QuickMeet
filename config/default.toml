@@ -1,0 +1,54 @@
+# QuickMeet 默认配置（Stage 1）
+#
+# 加载顺序（后者覆盖前者）：
+#   1. 本文件 config/default.toml
+#   2. config/local.json（可选，存在才加载，用于私有化现场覆盖）
+#   3. 环境变量 QM_SECTION_FIELD（如 QM_MEDIA_PORT=8090 -> media.port）
+#      只按**第一个** `_` 分层：QM_MEDIA_SIGNALING_PORT -> media.signaling_port。
+#      写错字段名会直接报错，不会静默忽略。
+#
+# 全局约束（见 Epic YEJ-89）：
+#   - 媒体服务默认监听 8080；
+#   - 只允许内网网段，默认 192.168.0.0/24；
+#   - AI 能力只对接本地部署的硅基流动接口，禁止公网第三方 API；
+#   - 音视频 / 会议数据必须本地存储，不得上传公网。
+
+[media]
+# 媒体服务监听端口（全局约束：8080）
+port = 8080
+# 信令 HTTP 服务端口
+signaling_port = 8081
+# 单会议最大参与者数，0 表示不限制
+max_participants = 64
+# 会话空闲超时（秒），超时后关闭 PeerConnection 释放资源
+idle_timeout_secs = 600
+
+[network]
+# 允许的本机 / 对端地址网段。只放行内网，公网地址会被拒绝。
+cidrs = ["192.168.0.0/24"]
+# 服务绑定地址：绑定具体内网网卡，而不是 0.0.0.0。
+# 本机若没有 192.168.0.10 这张网卡，用环境变量覆盖即可，不用改代码：
+#   QM_NETWORK_BIND_HOST=127.0.0.1 cargo run --release -- --signal
+bind_host = "192.168.0.10"
+
+[logging]
+# trace / debug / info / warn / error，支持组合：info,webrtc=debug,qm_media=trace
+# 注意：组合之间只能有逗号，逗号后面**不能有空格**，否则后面的 target 会被静默丢弃。
+level = "info"
+# 日志文件目录；留空则不写文件日志（只写 stdout）
+file_dir = ""
+# 容器化场景建议打开，便于日志采集器解析
+json = false
+
+[storage]
+# 会议数据根目录（录音 / 录像 / 事件审计都落在这里，不出域）
+data_dir = "./data/meetings"
+# 录制文件是否加密（第一阶段保留开关，实现由后续 Issue 提供）
+encrypted = false
+
+[ai]
+# 第一阶段默认关闭，仅保留接入点
+enabled = false
+# 本地部署的硅基流动接口；必须是内网地址，禁止公网第三方 API
+base_url = "http://127.0.0.1:3000/v1"
+timeout_ms = 30000

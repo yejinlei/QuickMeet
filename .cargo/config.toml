@@ -1,0 +1,11 @@
+# QuickMeet 本地 Cargo 配置
+#
+# 验收标准 1 要求能在 Rust 1.75+ 稳定版构建。crates.io 上很多 crate 的最新版
+# 已经声明了更高的 rust-version；如果不做处理，`cargo build` 会按 semver 选到
+# 最新版本，然后在 1.75 上因为依赖的 MSRV 太新而编译失败。
+#
+# `incompatible-rust-versions = "fallback"` 让 Cargo 在解析时**优先选择满足
+# 当前 rust-version 的版本**，只有没有兼容版本时才回退到最新版（并给出警告）。
+# 该设置由 Cargo 1.84+ 支持（stable），需要先用新版 cargo 生成一次 Cargo.lock。
+[resolver]
+incompatible-rust-versions = "fallback"

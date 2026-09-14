@@ -1,0 +1,26 @@
+[package]
+name = "qm-common"
+description = "QuickMeet 公共基础：错误模型、配置加载、日志初始化、本地持久化"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+figment.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+chrono.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

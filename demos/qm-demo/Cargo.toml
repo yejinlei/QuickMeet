@@ -1,0 +1,24 @@
+[package]
+name = "qm-demo"
+description = "QuickMeet 可本地运行的 demo：跑通信令服务 + 输出三 codec 收发兼容验证报告"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qm-demo"
+path = "src/main.rs"
+
+[dependencies]
+qm-common = { path = "../../crates/qm-common" }
+qm-media = { path = "../../crates/qm-media" }
+qm-signaling = { path = "../../crates/qm-signaling" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
