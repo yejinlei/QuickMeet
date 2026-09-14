@@ -203,13 +203,28 @@ pub fn simulate_capacity(config: &CapacityConfig) -> BenchmarkReport {
 
     // === 瓶颈分析 ===
     let bottleneck = if cpu_usage > 0.8 {
-        format!("CPU bottleneck: {:.1}% utilization at {} streams", cpu_usage * 100.0, config.stream_count)
+        format!(
+            "CPU bottleneck: {:.1}% utilization at {} streams",
+            cpu_usage * 100.0,
+            config.stream_count
+        )
     } else if memory_mb > 4096.0 {
-        format!("Memory bottleneck: {:.0} MB at {} streams", memory_mb, config.stream_count)
+        format!(
+            "Memory bottleneck: {:.0} MB at {} streams",
+            memory_mb, config.stream_count
+        )
     } else if total_throughput > 1_000_000_000 {
-        format!("Network bandwidth bottleneck: {:.1} Gbps aggregate throughput", total_throughput as f64 / 1e9)
+        format!(
+            "Network bandwidth bottleneck: {:.1} Gbps aggregate throughput",
+            total_throughput as f64 / 1e9
+        )
     } else {
-        format!("No bottleneck at {} streams ({:.1}% CPU, {:.0} MB mem)", config.stream_count, cpu_usage * 100.0, memory_mb)
+        format!(
+            "No bottleneck at {} streams ({:.1}% CPU, {:.0} MB mem)",
+            config.stream_count,
+            cpu_usage * 100.0,
+            memory_mb
+        )
     };
 
     let meets_target = config.stream_count >= 200 && avg_latency <= 200.0;
@@ -234,31 +249,71 @@ pub fn render_report(report: &BenchmarkReport) -> String {
     let mut out = String::new();
     out.push_str("QuickMeet SFU capacity benchmark\n");
     out.push_str(&format!("────────────────────────────────────────\n"));
-    out.push_str(&format!("Streams:      {} ({}x{}@{}fps)\n",
-        report.config.stream_count, report.config.width, report.config.height, report.config.fps));
-    out.push_str(&format!("Bitrate:      {} Mbps/stream\n", report.config.bitrate_bps / 1_000_000));
-    out.push_str(&format!("Subs/stream:   {}\n", report.config.subs_per_stream));
-    out.push_str(&format!("Recovery:     {}\n", if report.config.recovery_enabled { "NACK+FEC" } else { "disabled" }));
+    out.push_str(&format!(
+        "Streams:      {} ({}x{}@{}fps)\n",
+        report.config.stream_count, report.config.width, report.config.height, report.config.fps
+    ));
+    out.push_str(&format!(
+        "Bitrate:      {} Mbps/stream\n",
+        report.config.bitrate_bps / 1_000_000
+    ));
+    out.push_str(&format!(
+        "Subs/stream:   {}\n",
+        report.config.subs_per_stream
+    ));
+    out.push_str(&format!(
+        "Recovery:     {}\n",
+        if report.config.recovery_enabled {
+            "NACK+FEC"
+        } else {
+            "disabled"
+        }
+    ));
     out.push_str(&format!("────────────────────────────────────────\n"));
-    out.push_str(&format!("Throughput:   {:.2} Gbps total\n", report.total_throughput_bps as f64 / 1e9));
-    out.push_str(&format!("Packets/s:    {}\n", report.total_packets_per_second));
+    out.push_str(&format!(
+        "Throughput:   {:.2} Gbps total\n",
+        report.total_throughput_bps as f64 / 1e9
+    ));
+    out.push_str(&format!(
+        "Packets/s:    {}\n",
+        report.total_packets_per_second
+    ));
     out.push_str(&format!("CPU usage:    {:.1}%\n", report.cpu_usage * 100.0));
     out.push_str(&format!("Memory:       {:.0} MB\n", report.memory_mb));
-    out.push_str(&format!("Latency:      {:.1} ms (target <=200ms)\n", report.avg_latency_ms));
-    out.push_str(&format!("  forward:   {:.1} ms\n", report.latency.forward_ms));
-    out.push_str(&format!("  network:   {:.1} ms\n", report.latency.network_ms));
-    out.push_str(&format!("  nack rtt:  {:.1} ms\n", report.latency.nack_rtt_ms));
-    out.push_str(&format!("  fec decode:{:.1} ms\n", report.latency.fec_decode_ms));
-    out.push_str(&format!("Recovery:     {} sent, {} lost, {} recovered ({}% rate)\n",
+    out.push_str(&format!(
+        "Latency:      {:.1} ms (target <=200ms)\n",
+        report.avg_latency_ms
+    ));
+    out.push_str(&format!(
+        "  forward:   {:.1} ms\n",
+        report.latency.forward_ms
+    ));
+    out.push_str(&format!(
+        "  network:   {:.1} ms\n",
+        report.latency.network_ms
+    ));
+    out.push_str(&format!(
+        "  nack rtt:  {:.1} ms\n",
+        report.latency.nack_rtt_ms
+    ));
+    out.push_str(&format!(
+        "  fec decode:{:.1} ms\n",
+        report.latency.fec_decode_ms
+    ));
+    out.push_str(&format!(
+        "Recovery:     {} sent, {} lost, {} recovered ({}% rate)\n",
         report.recovery.packets_sent,
         report.recovery.packets_lost,
         report.recovery.nack_recovered + report.recovery.fec_recovered,
-        (report.recovery.recovery_rate() * 100.0) as u32));
+        (report.recovery.recovery_rate() * 100.0) as u32
+    ));
     out.push_str(&format!("Bottleneck:   {}\n", report.bottleneck));
-    out.push_str(&format!("Meets target: {} ({} streams, {:.1}ms latency)\n",
+    out.push_str(&format!(
+        "Meets target: {} ({} streams, {:.1}ms latency)\n",
         if report.meets_target { "YES" } else { "NO" },
         report.config.stream_count,
-        report.avg_latency_ms));
+        report.avg_latency_ms
+    ));
     out
 }
 
@@ -289,7 +344,10 @@ mod tests {
         let report = simulate_capacity(&cfg);
         assert!(report.meets_target, "200 streams should meet target");
         assert!(report.avg_latency_ms <= 200.0, "latency should be <=200ms");
-        assert!(report.cpu_usage < 0.8, "CPU should have headroom at 200 streams");
+        assert!(
+            report.cpu_usage < 0.8,
+            "CPU should have headroom at 200 streams"
+        );
         assert!(report.memory_mb < 4096.0, "memory should be reasonable");
     }
 
@@ -301,7 +359,10 @@ mod tests {
         };
         let report = simulate_capacity(&cfg);
         // 300 streams should still work (showing headroom)
-        assert!(report.avg_latency_ms <= 200.0, "latency still under 200ms at 300 streams");
+        assert!(
+            report.avg_latency_ms <= 200.0,
+            "latency still under 200ms at 300 streams"
+        );
     }
 
     #[test]
@@ -312,8 +373,16 @@ mod tests {
         };
         let report = simulate_capacity(&cfg);
         // 500 streams at 30fps = 15000 pps -> high CPU utilization
-        assert!(report.cpu_usage > 0.3, "500 streams should show high CPU, got {}", report.cpu_usage);
-        assert!(report.bottleneck.contains("CPU") || report.bottleneck.contains("Memory") || report.bottleneck.contains("bandwidth"));
+        assert!(
+            report.cpu_usage > 0.3,
+            "500 streams should show high CPU, got {}",
+            report.cpu_usage
+        );
+        assert!(
+            report.bottleneck.contains("CPU")
+                || report.bottleneck.contains("Memory")
+                || report.bottleneck.contains("bandwidth")
+        );
     }
 
     #[test]
@@ -325,8 +394,10 @@ mod tests {
         };
         let report_with = simulate_capacity(&cfg_with);
         let report_without = simulate_capacity(&cfg_without);
-        assert!(report_with.cpu_usage >= report_without.cpu_usage,
-            "recovery adds CPU overhead");
+        assert!(
+            report_with.cpu_usage >= report_without.cpu_usage,
+            "recovery adds CPU overhead"
+        );
     }
 
     #[test]

@@ -17,7 +17,11 @@ use clap::Parser;
 use qm_common::{config, logging};
 
 #[derive(Debug, Parser)]
-#[command(name = "qm-demo", version, about = "QuickMeet Stage 1 demo：编解码收发验证 + 内网信令服务")]
+#[command(
+    name = "qm-demo",
+    version,
+    about = "QuickMeet Stage 1 demo：编解码收发验证 + 内网信令服务"
+)]
 struct Args {
     /// 配置目录（含 default.toml / local.json）
     #[arg(long, default_value = "./config")]
@@ -30,6 +34,10 @@ struct Args {
     /// 媒体服务监听地址（覆盖配置的 network.bind_host，本机测试用 127.0.0.1）
     #[arg(long)]
     bind: Option<String>,
+
+    /// 集群模式：连接 NATS、加入集群并运行心跳/调度/故障迁移循环（QM-006）
+    #[arg(long)]
+    cluster: bool,
 
     /// 每个 codec 验证的帧数
     #[arg(long, default_value_t = 10)]
@@ -62,6 +70,7 @@ fn run() -> anyhow::Result<()> {
     print_codec_report(args.frames)?;
     save_json_report(&cfg, args.frames, args.json_report)?;
 
+    // `--signal` 会把 `cfg` move 进 runtime，所以提前克隆一份句柄。
     if args.signal {
         tracing::info!("启动信令服务（Ctrl+C 退出）");
         let signal_cfg = Arc::new(cfg);
@@ -75,6 +84,12 @@ fn run() -> anyhow::Result<()> {
                 }
                 Ok::<(), anyhow::Error>(())
             })?;
+    }
+
+    // 集群模式走独立入口：配置加载、合规校验、NATS 连接、心跳/调度/迁移循环
+    // 与 Ctrl+C 退出都在 `qm_cluster::run_cluster` 里，容器命令直接传 `--cluster` 即可。
+    if args.cluster {
+        qm_cluster::run_cluster(&args.config)?;
     }
 
     Ok(())
@@ -129,8 +144,7 @@ fn save_json_report(
         "reports": reports,
     });
     let dir = &cfg.storage.data_dir;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("创建数据目录失败：{dir}"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("创建数据目录失败：{dir}"))?;
     let path = format!("{dir}/codec-report.json");
     qm_common::storage::atomic_write_json(&path, &report)?;
     tracing::info!(%path, "验证报告已落盘（本地存储）");
@@ -154,7 +168,6 @@ fn main() {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

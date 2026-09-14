@@ -8,7 +8,7 @@ pub mod error;
 pub mod logging;
 pub mod storage;
 
-pub use config::{AppConfig, ConfigSource};
+pub use config::{AppConfig, ClusterConfig, ConfigSource, NodeRole};
 pub use error::{Cidr, Error, ErrorKind, Result};
 
 /// 运行时版本与约束快照，便于在日志与验收记录中固化构建参数。
@@ -33,7 +33,11 @@ mod tests {
         assert_eq!(DEFAULT_MEDIA_PORT, 8080);
         // 默认配置与常量一致，防止常量与默认值漂移
         assert_eq!(AppConfig::default().media.port, DEFAULT_MEDIA_PORT);
-        assert!(AppConfig::default().network.cidrs.iter().any(|c| c == DEFAULT_CIDR));
+        assert!(AppConfig::default()
+            .network
+            .cidrs
+            .iter()
+            .any(|c| c == DEFAULT_CIDR));
     }
 
     #[test]

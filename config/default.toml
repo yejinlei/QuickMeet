@@ -52,3 +52,44 @@ enabled = false
 # 本地部署的硅基流动接口；必须是内网地址，禁止公网第三方 API
 base_url = "http://127.0.0.1:3000/v1"
 timeout_ms = 30000
+
+[cluster]
+# 分布式集群（QM-006）：NATS 房间状态同步 + 最低负载调度 + 健康检查与故障迁移。
+#
+# 地址合规（全局约束 3/5）：server 与 advertised_addr 必须是内网 IPv4。
+# 唯一例外是 127.0.0.1 —— 那是 NATS 与节点同机（sidecar / 本机起 server）的写法，
+# 回环流量不离开本机，仍然满足「数据不出域」。公网地址会直接拒绝启动。
+
+# NATS 服务端地址；多节点共享同一个 NATS（本方案的单一协调点）。
+server = "127.0.0.1"
+# NATS 客户端端口。
+port = 4222
+# 集群标识：同名集群才共享房间状态与调度视图（测试/生产共用一个 NATS 时不会串）。
+cluster_id = "quickmeet"
+# 本节点唯一标识；集群内必须唯一，写进心跳与房间归属。
+node_id = "node-1"
+# 对外通告的媒体地址，供旁听节点回源拉流。多节点部署时每台必须不同。
+advertised_addr = "192.168.0.10:8080"
+# 节点角色：full = 全功能媒体节点（参与调度）；listener = 旁听分发节点。
+node_role = "full"
+
+# 健康检查心跳间隔（秒）。
+heartbeat_secs = 5
+# 连续错过多少次心跳即判定节点故障。
+# 判死窗口 = heartbeat_secs × unhealthy_misses = 5 × 2 = 10s（验收标准 2）。
+unhealthy_misses = 2
+# 判定故障后，多久内必须完成会议迁移（秒）。
+failover_target_secs = 10
+# 新节点上线后，多久内必须完成加入并开始承接新会议（秒）。
+join_target_secs = 30
+# 单次 NATS 请求超时（秒）：必须小于 heartbeat_secs，否则「请求超时」
+# 会被误判成「节点故障」。
+request_timeout_secs = 3
+
+# 单节点最多承载的会议数（调度硬上限）。
+max_rooms_per_node = 64
+# 单节点旁听参会者上限（验收标准 3 的容量口径）。
+listener_capacity = 20000
+# 单条上行流按多少倍只收流观众折算媒体容量。
+# 旁听容量 = listener_fanout × listener_capacity = 200 × 20000 = 4,000,000 槽位。
+listener_fanout = 200

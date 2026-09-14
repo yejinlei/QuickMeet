@@ -7,7 +7,6 @@
 //! 3. 可替换 —— 通过 `native-opus` / `native-h264` / `native-vp8` 特性接入真实编解码器，
 //!    替换点集中在 [`crate::registry`]，不改动上层调用。
 
-
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -122,7 +121,9 @@ impl DecoderSlot {
 
 impl std::fmt::Debug for Codec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Codec").field("params", &self.params).finish()
+        f.debug_struct("Codec")
+            .field("params", &self.params)
+            .finish()
     }
 }
 

@@ -91,13 +91,15 @@ fn attach_handlers(
     }))?;
 
     // Data channel：offer 端 `create_data_channel`，answer 端在这里收到。
-    pc.on_data_channel(Box::new(move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
-        *data_ready.lock() += 1;
-        let sink = data_msgs.clone();
-        let _ = dc.on_message(Box::new(move |msg| {
-            sink.lock().push(msg.data.to_vec());
-        }));
-    }))?;
+    pc.on_data_channel(Box::new(
+        move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
+            *data_ready.lock() += 1;
+            let sink = data_msgs.clone();
+            let _ = dc.on_message(Box::new(move |msg| {
+                sink.lock().push(msg.data.to_vec());
+            }));
+        },
+    ))?;
 
     Ok(())
 }
@@ -127,8 +129,24 @@ pub async fn run(frames: u32) -> Result<PeerConnectionReport> {
     let pc1 = api.create_peer_connection("QuickMeet-offer".to_string())?;
     let pc2 = api.create_peer_connection("QuickMeet-answer".to_string())?;
 
-    attach_handlers(pc1.clone(), state1.clone(), tracks1.clone(), packets1.clone(), cands1.clone(), msgs1.clone(), ready1.clone())?;
-    attach_handlers(pc2.clone(), state2.clone(), tracks2.clone(), packets2.clone(), cands2.clone(), msgs2.clone(), ready2.clone())?;
+    attach_handlers(
+        pc1.clone(),
+        state1.clone(),
+        tracks1.clone(),
+        packets1.clone(),
+        cands1.clone(),
+        msgs1.clone(),
+        ready1.clone(),
+    )?;
+    attach_handlers(
+        pc2.clone(),
+        state2.clone(),
+        tracks2.clone(),
+        packets2.clone(),
+        cands2.clone(),
+        msgs2.clone(),
+        ready2.clone(),
+    )?;
 
     // 双向 Opus 轨道：每端既是发送方也是接收方。
     // 导入点 2：webrtc::media::Sample（webrtc-media 0.17 的重导出）。
@@ -184,7 +202,11 @@ pub async fn run(frames: u32) -> Result<PeerConnectionReport> {
         )
         .data;
         writer1
-            .write_sample(Sample { payload: pcm.clone(), is_key_frame: true, padding: vec![] })
+            .write_sample(Sample {
+                payload: pcm.clone(),
+                is_key_frame: true,
+                padding: vec![],
+            })
             .map_err(|e| Error::WebRtc(e.to_string()))?;
         let pcm2 = crate::frame::Frame::synthetic_audio(
             crate::codec_id::OPUS_FRAME_20MS_SAMPLES,
@@ -193,7 +215,11 @@ pub async fn run(frames: u32) -> Result<PeerConnectionReport> {
         )
         .data;
         writer2
-            .write_sample(Sample { payload: pcm2, is_key_frame: true, padding: vec![] })
+            .write_sample(Sample {
+                payload: pcm2,
+                is_key_frame: true,
+                padding: vec![],
+            })
             .map_err(|e| Error::WebRtc(e.to_string()))?;
         if frames > 1 {
             // 给对端留出 ICE/DTLS 收敛与 RTP 消费的时间。

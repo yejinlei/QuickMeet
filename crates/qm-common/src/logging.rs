@@ -110,7 +110,10 @@ mod tests {
         assert!(SUBSCRIBER_INIT.get().is_some(), "初始化后必须已占位");
         init_subscriber(&cfg); // 幂等：重复调用不应 panic
         init_subscriber(&AppConfig::default());
-        assert!(FILE_GUARD.get().is_none(), "未声明 file_dir 时不应创建落盘线程");
+        assert!(
+            FILE_GUARD.get().is_none(),
+            "未声明 file_dir 时不应创建落盘线程"
+        );
     }
 
     #[test]

@@ -64,7 +64,11 @@ impl IceServer {
     }
 
     /// 构造 TURN server。
-    pub fn turn(address: impl Into<String>, username: impl Into<String>, credential: impl Into<String>) -> Self {
+    pub fn turn(
+        address: impl Into<String>,
+        username: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
         Self {
             kind: IceServerKind::Turn,
             address: address.into(),
@@ -125,9 +129,9 @@ impl IceConfig {
     pub fn validate(&self, allowlist: &[qm_common::Cidr]) -> Result<(), String> {
         for s in &self.servers {
             let host = s.host();
-            let addr: IpAddr = host.parse().map_err(|e| {
-                format!("ICE server 地址非法: {host}: {e}")
-            })?;
+            let addr: IpAddr = host
+                .parse()
+                .map_err(|e| format!("ICE server 地址非法: {host}: {e}"))?;
             let ok = allowlist.iter().any(|c| c.contains(addr));
             if !ok {
                 return Err(format!(
@@ -141,12 +145,18 @@ impl IceConfig {
 
     /// STUN server 列表。
     pub fn stun_servers(&self) -> Vec<&IceServer> {
-        self.servers.iter().filter(|s| s.kind == IceServerKind::Stun).collect()
+        self.servers
+            .iter()
+            .filter(|s| s.kind == IceServerKind::Stun)
+            .collect()
     }
 
     /// TURN server 列表。
     pub fn turn_servers(&self) -> Vec<&IceServer> {
-        self.servers.iter().filter(|s| s.kind == IceServerKind::Turn).collect()
+        self.servers
+            .iter()
+            .filter(|s| s.kind == IceServerKind::Turn)
+            .collect()
     }
 }
 
@@ -202,22 +212,22 @@ pub fn simulate_nat(nat_type: NatType, cfg: &IceConfig) -> NatSimulation {
     match nat_type {
         NatType::None => NatSimulation {
             nat_type,
-            stun_succeeded: true,  // 直连，不需要 STUN
+            stun_succeeded: true, // 直连，不需要 STUN
             turn_used: false,
             selected_servers: selected_count,
             description: "无 NAT：host candidate 直连，无需 STUN/TURN".to_string(),
         },
         NatType::Cone => NatSimulation {
             nat_type,
-            stun_succeeded: true,  // 锥形 NAT，STUN 可打洞
-            turn_used: false,      // 打洞成功，不需要中继
+            stun_succeeded: true, // 锥形 NAT，STUN 可打洞
+            turn_used: false,     // 打洞成功，不需要中继
             selected_servers: selected_count,
             description: "锥形 NAT：STUN 打洞成功，TURN 备用未使用".to_string(),
         },
         NatType::Symmetric => NatSimulation {
             nat_type,
             stun_succeeded: false, // 对称 NAT，STUN 打洞通常失败
-            turn_used: true,        // 需要 TURN 中继
+            turn_used: true,       // 需要 TURN 中继
             selected_servers: selected_count,
             description: "对称 NAT：STUN 打洞失败，TURN 中继兜底".to_string(),
         },

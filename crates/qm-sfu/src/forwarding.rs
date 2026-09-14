@@ -132,7 +132,10 @@ pub fn simulate_forward_batch(
             stats.record(&d, packet_bytes);
             // 只保留最终决策（不重复存 N 个相同决策），但统计累加。
             // 对于测试断言，第一次决策已经包含全部信息。
-            if decisions.iter().all(|existing: &ForwardDecision| existing.track_id != d.track_id) {
+            if decisions
+                .iter()
+                .all(|existing: &ForwardDecision| existing.track_id != d.track_id)
+            {
                 decisions.push(d.clone());
             }
         }
@@ -149,12 +152,7 @@ mod tests {
 
     fn make_track(publisher: &str, kind: TrackKind, subs: &[&str]) -> Track {
         let id = format!("{publisher}_{kind}");
-        let mut t = Track::new(
-            id,
-            "room1".to_string(),
-            publisher.to_string(),
-            kind,
-        );
+        let mut t = Track::new(id, "room1".to_string(), publisher.to_string(), kind);
         for s in subs {
             t.subscribe(s);
         }

@@ -21,6 +21,8 @@ pub enum ErrorKind {
     Internal,
     /// 本地 AI 接口错误（仅允许对接本地部署的硅基流动接口）。
     Ai,
+    /// 集群（NATS 状态同步 / 路由 / 健康检查）错误。
+    Cluster,
 }
 
 /// QuickMeet 统一错误类型。
@@ -49,6 +51,9 @@ pub enum Error {
     #[error("本地 AI 接口错误: {0}")]
     Ai(String),
 
+    #[error("集群错误: {0}")]
+    Cluster(String),
+
     #[error("非法输入: {0}")]
     InvalidArgument(String),
 
@@ -71,6 +76,7 @@ impl Error {
             Error::WebRtc(_) => ErrorKind::WebRtc,
             Error::Codec { .. } => ErrorKind::Codec,
             Error::Storage(_) => ErrorKind::Storage,
+            Error::Cluster(_) => ErrorKind::Cluster,
             Error::Ai(_) => ErrorKind::Ai,
             Error::InvalidArgument(_) => ErrorKind::InvalidArgument,
             Error::Internal(_) => ErrorKind::Internal,
@@ -98,6 +104,16 @@ impl Error {
             codec: codec.into(),
             message: message.into(),
         }
+    }
+
+    /// 本地 AI 接口错误。
+    pub fn ai(message: impl Into<String>) -> Self {
+        Self::Ai(message.into())
+    }
+
+    /// 集群（NATS 状态同步 / 路由 / 健康检查）错误。
+    pub fn cluster(message: impl Into<String>) -> Self {
+        Self::Cluster(message.into())
     }
 
     /// 信令层错误（SDP / ICE candidate 转发与准入）。
@@ -141,16 +157,21 @@ pub struct Cidr {
 impl Cidr {
     /// 解析 `192.168.0.0/24` 形式。
     pub fn parse(s: &str) -> Result<Self> {
-        let (net, prefix) =
-            s.split_once('/').ok_or_else(|| Error::InvalidArgument(format!("CIDR 缺少 '/': {s}")))?;
-        let network: IpAddr = net.trim().parse().map_err(|e| {
-            Error::InvalidArgument(format!("CIDR 网络地址非法: {net}: {e}"))
-        })?;
-        let prefix: u8 = prefix.trim().parse().map_err(|e| {
-            Error::InvalidArgument(format!("CIDR 前缀非法: {prefix}: {e}"))
-        })?;
+        let (net, prefix) = s
+            .split_once('/')
+            .ok_or_else(|| Error::InvalidArgument(format!("CIDR 缺少 '/': {s}")))?;
+        let network: IpAddr = net
+            .trim()
+            .parse()
+            .map_err(|e| Error::InvalidArgument(format!("CIDR 网络地址非法: {net}: {e}")))?;
+        let prefix: u8 = prefix
+            .trim()
+            .parse()
+            .map_err(|e| Error::InvalidArgument(format!("CIDR 前缀非法: {prefix}: {e}")))?;
         if prefix > 32 {
-            return Err(Error::InvalidArgument(format!("CIDR 前缀 {prefix} 超过上限 32")));
+            return Err(Error::InvalidArgument(format!(
+                "CIDR 前缀 {prefix} 超过上限 32"
+            )));
         }
         Ok(Self { network, prefix })
     }
@@ -161,7 +182,11 @@ impl Cidr {
             (IpAddr::V4(net), IpAddr::V4(a)) => {
                 let want = u32::from(net);
                 let have = u32::from(a);
-                let mask = if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix) };
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix)
+                };
                 want & mask == have & mask
             }
             _ => false,

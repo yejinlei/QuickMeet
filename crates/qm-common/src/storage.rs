@@ -36,15 +36,16 @@ pub fn append_jsonl<T: Serialize>(path: impl AsRef<Path>, records: &[T]) -> Resu
         .map_err(|e| Error::Storage(format!("打开 {path:?} 失败: {e}")))?;
     let mut stats = WriteStats::default();
     for r in records {
-        let mut line = serde_json::to_string(r)
-            .map_err(|e| Error::Storage(format!("序列化失败: {e}")))?;
+        let mut line =
+            serde_json::to_string(r).map_err(|e| Error::Storage(format!("序列化失败: {e}")))?;
         line.push('\n');
         f.write_all(line.as_bytes())
             .map_err(|e| Error::Storage(format!("写入 {path:?} 失败: {e}")))?;
         stats.bytes += line.len() as u64;
         stats.records += 1;
     }
-    f.flush().map_err(|e| Error::Storage(format!("flush {path:?} 失败: {e}")))?;
+    f.flush()
+        .map_err(|e| Error::Storage(format!("flush {path:?} 失败: {e}")))?;
     Ok(stats)
 }
 
@@ -60,7 +61,8 @@ pub fn atomic_write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Res
     {
         let data = serde_json::to_vec_pretty(value)
             .map_err(|e| Error::Storage(format!("序列化失败: {e}")))?;
-        std::fs::write(&tmp, data).map_err(|e| Error::Storage(format!("写入 {tmp:?} 失败: {e}")))?;
+        std::fs::write(&tmp, data)
+            .map_err(|e| Error::Storage(format!("写入 {tmp:?} 失败: {e}")))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -71,7 +73,8 @@ pub fn atomic_write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Res
 
 /// 读回 JSON。
 pub fn read_json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> {
-    let data = std::fs::read(path.as_ref()).map_err(|e| Error::Storage(format!("读取失败: {e}")))?;
+    let data =
+        std::fs::read(path.as_ref()).map_err(|e| Error::Storage(format!("读取失败: {e}")))?;
     serde_json::from_slice(&data).map_err(|e| Error::Storage(format!("解析失败: {e}")))
 }
 
@@ -113,16 +116,38 @@ mod tests {
     fn append_jsonl_creates_file_and_is_readable() {
         let dir = tmpdir("append");
         let p = dir.join("events.jsonl");
-        let a = append_jsonl(&p, &[Rec { id: 1, msg: "start".into() }]).unwrap();
-        let b = append_jsonl(&p, &[Rec { id: 2, msg: "joined".into() }, Rec { id: 3, msg: "left".into() }])
-            .unwrap();
+        let a = append_jsonl(
+            &p,
+            &[Rec {
+                id: 1,
+                msg: "start".into(),
+            }],
+        )
+        .unwrap();
+        let b = append_jsonl(
+            &p,
+            &[
+                Rec {
+                    id: 2,
+                    msg: "joined".into(),
+                },
+                Rec {
+                    id: 3,
+                    msg: "left".into(),
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(a.records, 1);
         assert_eq!(b.records, 2);
         let text = std::fs::read_to_string(&p).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "应为 3 行 JSONL: {text:?}");
         assert!(lines[0].contains("\"id\":1"));
-        assert!(text.ends_with('\n'), "每行必须以换行结尾，保证进程被杀时不产生半行");
+        assert!(
+            text.ends_with('\n'),
+            "每行必须以换行结尾，保证进程被杀时不产生半行"
+        );
         // 追加写不覆盖历史
         assert_eq!(append_jsonl::<Rec>(&p, &[]).unwrap().records, 0);
     }
@@ -131,10 +156,24 @@ mod tests {
     fn atomic_write_json_replace_and_reread() {
         let dir = tmpdir("atomic");
         let p = dir.join("state.json");
-        atomic_write_json(&p, &Rec { id: 1, msg: "v1".into() }).unwrap();
+        atomic_write_json(
+            &p,
+            &Rec {
+                id: 1,
+                msg: "v1".into(),
+            },
+        )
+        .unwrap();
         let v: Rec = read_json(&p).unwrap();
         assert_eq!(v.msg, "v1");
-        atomic_write_json(&p, &Rec { id: 1, msg: "v2".into() }).unwrap();
+        atomic_write_json(
+            &p,
+            &Rec {
+                id: 1,
+                msg: "v2".into(),
+            },
+        )
+        .unwrap();
         let v: Rec = read_json(&p).unwrap();
         assert_eq!(v.msg, "v2", "原子写后应读到新值");
         assert!(
@@ -166,7 +205,10 @@ mod tests {
         #[derive(Debug)]
         struct NotSerializable;
         impl Serialize for NotSerializable {
-            fn serialize<S: serde::ser::Serializer>(&self, _s: S) -> std::result::Result<S::Ok, S::Error> {
+            fn serialize<S: serde::ser::Serializer>(
+                &self,
+                _s: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
                 Err(S::Error::custom("not serializable"))
             }
         }

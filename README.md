@@ -10,10 +10,14 @@
 ```bash
 cargo build --release
 ./target/release/qm-demo                      # 编解码收发兼容验证报告
-cargo test --workspace                         # 60 个回归测试
+cargo test --workspace                         # 166 个回归测试
 QM_NETWORK_BIND_HOST=127.0.0.1 \
   ./target/release/qm-demo --signal --bind 127.0.0.1   # 起信令服务
+./target/release/qm-demo --cluster                     # 集群模式（QM-006，需 NATS）
 ```
+
+集群部署与扩容见 `docs/CLUSTER_DESIGN.md`；`docker-compose up -d --build`
+内置 1 个 NATS + 3 个媒体节点 + 1 个信令服务。
 
 MSRV **1.75**，依赖全部来自 crates.io，无私有依赖。
 详细步骤见 `docs/RUNBOOK.md`。
@@ -25,10 +29,13 @@ MSRV **1.75**，依赖全部来自 crates.io，无私有依赖。
 | `crates/qm-common` | 错误模型（统一 `Error`）、配置加载、日志初始化、本地持久化、CIDR 校验 |
 | `crates/qm-media` | 可复用编解码封装：RTP（RFC 3550）、帧模型、codec registry、bitstream 打包、收发验证 |
 | `crates/qm-signaling` | tokio + hyper 信令服务，`GET /healthz` 探活、房间 peer 列表 |
-| `demos/qm-demo` | 可本地运行的 demo：跑验证报告 + 起信令服务 |
+| `crates/qm-sfu` | SFU：媒体路由、选择性转发、NACK/FEC 恢复、硬件加速、容量基准（200+ 流） |
+| `crates/qm-cluster` | 分布式集群：NATS 房间状态同步、最低负载调度、健康检查与故障迁移（QM-006） |
+| `demos/qm-demo` | 可本地运行的 demo：跑验证报告 + 起信令服务 + 集群模式 |
 | `config/` | `default.toml`、`local.json.example`、`container.env` |
 | `docs/RUNBOOK.md` | 构建/运行/验证/排错操作手册 |
-| `Dockerfile` `docker-compose.yml` | 容器化（按 docker-compose 1.29.2 语法编写） |
+| `docs/CLUSTER_DESIGN.md` | 集群架构、部署与扩容操作说明（QM-006） |
+| `Dockerfile` `docker-compose.yml` | 容器化（按 docker-compose 1.29.2 语法编写，内置 3 节点集群） |
 
 ## 编解码模块
 

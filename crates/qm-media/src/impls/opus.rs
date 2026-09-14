@@ -5,7 +5,6 @@
 //! 编解码接口与 SDP 参数（payload type 111 / 48 kHz / mono、帧长 20 ms = 960 采样）与真实后端一致，
 //! 验收标准 3 的收发兼容性结论同样适用；压缩比与听感需接真实 libopus（`--features native-opus`）后复测。
 
-
 use crate::bitstream::{checksum, push_u16, push_u32, take_u16, take_u32};
 use crate::codec::{Decoder, Encoder};
 use crate::codec_id::{CodecId, OPUS_FRAME_20MS_SAMPLES, OPUS_SAMPLE_RATE};
@@ -32,12 +31,19 @@ struct OpusDecoder {
 }
 
 fn err(message: impl Into<String>) -> Error {
-    Error::Codec { codec: "opus".into(), message: message.into() }
+    Error::Codec {
+        codec: "opus".into(),
+        message: message.into(),
+    }
 }
 
 /// 计算一帧音频包含的采样数。
 fn frame_samples(frame: &Frame) -> Result<u32> {
-    let ch = if frame.channels == 0 { 1 } else { frame.channels };
+    let ch = if frame.channels == 0 {
+        1
+    } else {
+        frame.channels
+    };
     if frame.data.is_empty() {
         return Err(err("Opus 输入为空 PCM 数据"));
     }
@@ -66,8 +72,16 @@ impl Encoder for OpusEncoder {
                 "Opus 采样数 {samples} 不是帧长 {FRAME_SAMPLES}（{OPUS_SAMPLE_RATE} Hz 下的 20 ms）的整数倍"
             )));
         }
-        let ch = if frame.channels == 0 { 1 } else { frame.channels };
-        let rate = if frame.sample_rate == 0 { OPUS_SAMPLE_RATE } else { frame.sample_rate };
+        let ch = if frame.channels == 0 {
+            1
+        } else {
+            frame.channels
+        };
+        let rate = if frame.sample_rate == 0 {
+            OPUS_SAMPLE_RATE
+        } else {
+            frame.sample_rate
+        };
 
         let mut data = Vec::with_capacity(frame.data.len() + HEADER_LEN);
         push_u32(&mut data, OPUS_MAGIC);
@@ -80,7 +94,11 @@ impl Encoder for OpusEncoder {
 
         self.ts = self.ts.wrapping_add(samples as u64);
         self.encoded += 1;
-        Ok(vec![Packet { data, marker: true, samples }])
+        Ok(vec![Packet {
+            data,
+            marker: true,
+            samples,
+        }])
     }
 
     fn encoded_frames(&self) -> u64 {
@@ -112,7 +130,9 @@ impl Decoder for OpusDecoder {
         }
         let got_crc = checksum(payload);
         if want_crc != got_crc {
-            return Err(err(format!("Opus 载荷 CRC 校验失败：期望 0x{want_crc:08x}，实际 0x{got_crc:08x}")));
+            return Err(err(format!(
+                "Opus 载荷 CRC 校验失败：期望 0x{want_crc:08x}，实际 0x{got_crc:08x}"
+            )));
         }
         if ch == 0 || rate == 0 || samples == 0 {
             return Err(err("Opus 头参数非法：声道数 / 采样率 / 采样数必须 > 0"));
@@ -142,7 +162,12 @@ pub fn new_encoder() -> Box<dyn Encoder> {
 }
 
 pub fn new_decoder() -> Box<dyn Decoder> {
-    Box::new(OpusDecoder { decoded: 0, last_rate: 0, last_channels: 0, last_samples: 0 })
+    Box::new(OpusDecoder {
+        decoded: 0,
+        last_rate: 0,
+        last_channels: 0,
+        last_samples: 0,
+    })
 }
 
 #[cfg(test)]

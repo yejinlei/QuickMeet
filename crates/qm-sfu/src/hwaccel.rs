@@ -144,7 +144,12 @@ pub fn detect_platform() -> Platform {
 /// * macOS   -> VideoToolbox > CPU
 pub fn candidate_backends(platform: Platform) -> Vec<HwBackend> {
     match platform {
-        Platform::Windows => vec![HwBackend::Nvenc, HwBackend::Qsv, HwBackend::Amf, HwBackend::Cpu],
+        Platform::Windows => vec![
+            HwBackend::Nvenc,
+            HwBackend::Qsv,
+            HwBackend::Amf,
+            HwBackend::Cpu,
+        ],
         Platform::Linux => vec![HwBackend::Vaapi, HwBackend::Cpu],
         Platform::Macos => vec![HwBackend::VideoToolbox, HwBackend::Cpu],
         Platform::Unknown => vec![HwBackend::Cpu],
@@ -200,7 +205,10 @@ pub fn select_codec_path(
     let reason = if reasons.is_empty() {
         "no hardware backends for platform".to_string()
     } else {
-        format!("hardware unavailable ({}); fallback to CPU", reasons.join("; "))
+        format!(
+            "hardware unavailable ({}); fallback to CPU",
+            reasons.join("; ")
+        )
     };
 
     CodecPath::software(codec, kind, reason)
@@ -368,7 +376,10 @@ mod tests {
     #[test]
     fn detect_platform_returns_valid() {
         let p = detect_platform();
-        assert!(matches!(p, Platform::Windows | Platform::Linux | Platform::Macos | Platform::Unknown));
+        assert!(matches!(
+            p,
+            Platform::Windows | Platform::Linux | Platform::Macos | Platform::Unknown
+        ));
     }
 
     #[test]

@@ -12,12 +12,11 @@
 //! 后端一致，因此验收标准 3 的收发兼容性结论同样适用；
 //! 仅码率/延迟指标需接真实 libvpx 后复测。
 
-
 use crate::bitstream::{checksum, push_u16, push_u32, rle_decode, rle_encode, take_u16, take_u32};
 use crate::codec::{Decoder, Encoder};
 use crate::codec_id::CodecId;
-use crate::frame::{Frame, Packet};
 use crate::codec_id::{VIDEO_CLOCK_HZ, VIDEO_TS_STEP};
+use crate::frame::{Frame, Packet};
 use qm_common::error::{Error, Result};
 
 /// VP8 载荷魔数。
@@ -42,7 +41,10 @@ struct Vp8Decoder {
 }
 
 fn err(message: impl Into<String>) -> Error {
-    Error::Codec { codec: "vp8".into(), message: message.into() }
+    Error::Codec {
+        codec: "vp8".into(),
+        message: message.into(),
+    }
 }
 
 impl Encoder for Vp8Encoder {
@@ -59,7 +61,10 @@ impl Encoder for Vp8Encoder {
         let uv_plane = y_size / 4; // 4:2:0：单个色度平面 = Y/4
         let need = y_size + 2 * uv_plane;
         if frame.data.len() < need {
-            return Err(err(format!("VP8 输入平面不足：需要 >= {need} 字节，实际 {} 字节", frame.data.len())));
+            return Err(err(format!(
+                "VP8 输入平面不足：需要 >= {need} 字节，实际 {} 字节",
+                frame.data.len()
+            )));
         }
         let y = &frame.data[..y_size];
         let u = &frame.data[y_size..y_size + uv_plane];
@@ -84,7 +89,11 @@ impl Encoder for Vp8Encoder {
 
         self.ts = (self.ts + VIDEO_TS_STEP) % VIDEO_CLOCK_HZ as u64;
         self.encoded += 1;
-        Ok(vec![Packet { data, marker: true, samples: 1 }])
+        Ok(vec![Packet {
+            data,
+            marker: true,
+            samples: 1,
+        }])
     }
 
     fn encoded_frames(&self) -> u64 {
@@ -109,13 +118,19 @@ impl Decoder for Vp8Decoder {
         let w = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
         let h = u32::from_le_bytes([d[8], d[9], d[10], d[11]]);
         if d.len() < header_len() {
-            return Err(err(format!("载荷长度 {} 小于头长 {}", d.len(), header_len())));
+            return Err(err(format!(
+                "载荷长度 {} 小于头长 {}",
+                d.len(),
+                header_len()
+            )));
         }
         let want_crc = take_u32(&d[20..24]).ok_or_else(|| err("载荷截断：缺少 CRC"))?;
         let body = &d[header_len()..];
         let got_crc = checksum(body);
         if want_crc != got_crc {
-            return Err(err(format!("载荷 CRC 校验失败：期望 0x{want_crc:08x}，实际 0x{got_crc:08x}")));
+            return Err(err(format!(
+                "载荷 CRC 校验失败：期望 0x{want_crc:08x}，实际 0x{got_crc:08x}"
+            )));
         }
 
         let y_size = take_u32(body).ok_or_else(|| err("载荷截断：缺少平面长度"))? as usize;
@@ -145,8 +160,11 @@ impl Decoder for Vp8Decoder {
 /// 读一个游程编码平面：先定位记录结束位置，再还原。
 fn read_plane(body: &[u8], p: &mut usize, expect: usize) -> Result<Vec<u8>> {
     let off = *p;
-    let n_runs = take_u32(body.get(off..).ok_or_else(|| err("载荷截断：平面记录缺失"))?)
-            .ok_or_else(|| err("载荷截断：平面游程数缺失"))? as usize;
+    let n_runs = take_u32(
+        body.get(off..)
+            .ok_or_else(|| err("载荷截断：平面记录缺失"))?,
+    )
+    .ok_or_else(|| err("载荷截断：平面游程数缺失"))? as usize;
     let mut q = off + 4;
     for _ in 0..n_runs {
         if body.get(q..q.saturating_add(5)).is_none() {
@@ -156,7 +174,10 @@ fn read_plane(body: &[u8], p: &mut usize, expect: usize) -> Result<Vec<u8>> {
     }
     let got = rle_decode(&body[off..q]).ok_or_else(|| err("载荷损坏：游程解码失败"))?;
     if got.len() != expect {
-        return Err(err(format!("平面长度不匹配：期望 {expect} 字节，实际 {} 字节", got.len())));
+        return Err(err(format!(
+            "平面长度不匹配：期望 {expect} 字节，实际 {} 字节",
+            got.len()
+        )));
     }
     *p = q;
     Ok(got)

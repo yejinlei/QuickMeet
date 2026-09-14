@@ -262,16 +262,15 @@ impl SignalRouter {
         let m: JoinBody = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(e) => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    format!("join 请求体解析失败：{e}"),
-                )
+                return json_err(StatusCode::BAD_REQUEST, format!("join 请求体解析失败：{e}"))
             }
         };
         if let Err(e) = self.check_peer(&m.peer) {
             return json_err(StatusCode::FORBIDDEN, e.to_string());
         }
-        let id = m.peer_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = m
+            .peer_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let address = m.peer.clone();
         let mut st = self.state.lock();
         let peers = &mut st.rooms.entry(room.to_string()).or_default().peers;
@@ -303,7 +302,11 @@ impl SignalRouter {
         let kind = m.kind.clone();
         self.state.lock().sdp_exchanges += 1;
         debug!(room, kind, sdp_bytes = sdp_len, "信令转发 SDP");
-        json_ok(&ack(room, &m.peer, format!("已转发 {kind}（{sdp_len} 字节）")))
+        json_ok(&ack(
+            room,
+            &m.peer,
+            format!("已转发 {kind}（{sdp_len} 字节）"),
+        ))
     }
 
     fn candidate(&self, room: &str, body: &[u8]) -> Response<String> {
@@ -325,7 +328,11 @@ impl SignalRouter {
         let c = m.candidate.len();
         self.state.lock().candidates_exchanged += 1;
         debug!(room, chars = c, "信令转发 ICE candidate");
-        json_ok(&ack(room, &m.peer, format!("已转发 ICE candidate（{c} 字符）")))
+        json_ok(&ack(
+            room,
+            &m.peer,
+            format!("已转发 ICE candidate（{c} 字符）"),
+        ))
     }
 
     fn leave(&self, room: &str, body: &[u8]) -> Response<String> {
@@ -341,7 +348,9 @@ impl SignalRouter {
         if let Err(e) = self.check_peer(&m.peer) {
             return json_err(StatusCode::FORBIDDEN, e.to_string());
         }
-        let id = m.peer_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = m
+            .peer_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut st = self.state.lock();
         let room_left = st
             .rooms
@@ -374,7 +383,9 @@ pub struct SignalHttp {
 impl SignalHttp {
     /// 用路由器构造 HTTP 服务。
     pub fn new(router: SignalRouter) -> Self {
-        Self { inner: Arc::new(router) }
+        Self {
+            inner: Arc::new(router),
+        }
     }
 }
 
@@ -382,14 +393,10 @@ impl SignalHttp {
 impl Service<Request<hyper::Body>> for SignalHttp {
     type Response = Response<hyper::Body>;
     type Error = Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = QmResult<Self::Response>> + Send>,
-    >;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = QmResult<Self::Response>> + Send>>;
 
-    fn poll_ready(
-        &mut self,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<QmResult<()>> {
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<QmResult<()>> {
         std::task::Poll::Ready(Ok(()))
     }
 
@@ -457,21 +464,20 @@ pub async fn start(cfg: Arc<qm_common::AppConfig>) -> QmResult<()> {
     let host = cfg.network.bind_host.clone();
     let port = cfg.media.signaling_port;
     let addr = SocketAddr::new(
-        host.parse::<IpAddr>().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        host.parse::<IpAddr>()
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         port,
     );
     let router = SignalRouter::new(cfg.clone());
     tracing::info!(%host, %port, "信令服务启动（仅监听内网地址）");
-    let server = hyper::Server::bind(&addr).serve(
-        hyper::service::make_service_fn(move |_| {
-            let router = router.clone();
-            async move {
-                Ok::<_, Error>(hyper::service::service_fn(
-                    move |req: Request<hyper::Body>| handle_request(router.clone(), req),
-                ))
-            }
-        }),
-    );
+    let server = hyper::Server::bind(&addr).serve(hyper::service::make_service_fn(move |_| {
+        let router = router.clone();
+        async move {
+            Ok::<_, Error>(hyper::service::service_fn(
+                move |req: Request<hyper::Body>| handle_request(router.clone(), req),
+            ))
+        }
+    }));
     tokio::select! {
         r = server => r.map_err(|e| Error::signaling(e.to_string()))?,
         _ = tokio::signal::ctrl_c() => { tracing::info!("收到 Ctrl+C，信令服务退出"); }
@@ -502,7 +508,10 @@ mod tests {
         assert_eq!(r.media_port(), 8080, "媒体端口必须是 8080（Epic 约束 3）");
         assert_eq!(r.listen_port(), 8081, "信令端口与媒体端口错开");
         assert!(
-            r.allowlist().unwrap().iter().any(|c| c.contains("192.168.0.1".parse().unwrap())),
+            r.allowlist()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("192.168.0.1".parse().unwrap())),
             "允许列表必须覆盖 192.168.0.0/24（Epic 约束 3）"
         );
     }
@@ -523,34 +532,59 @@ mod tests {
     fn public_peer_is_forbidden() {
         let r = router();
         let body = br#"{"peer":"8.8.8.8:5060","peer_id":"p1"}"#;
-        assert_eq!(post(&r, "/room/a/join", body).status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            post(&r, "/room/a/join", body).status(),
+            StatusCode::FORBIDDEN
+        );
         // SDP / candidate 通道同样要挡住公网来源
         assert_eq!(
-            post(&r, "/room/a/offer", br#"{"peer":"1.2.3.4:1","sdp":"v=0","kind":"offer"}"#).status(),
+            post(
+                &r,
+                "/room/a/offer",
+                br#"{"peer":"1.2.3.4:1","sdp":"v=0","kind":"offer"}"#
+            )
+            .status(),
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            post(&r, "/room/a/candidate", br#"{"peer":"1.2.3.4:1","candidate":"c"}"#).status(),
+            post(
+                &r,
+                "/room/a/candidate",
+                br#"{"peer":"1.2.3.4:1","candidate":"c"}"#
+            )
+            .status(),
             StatusCode::FORBIDDEN
         );
         // 直连校验器：公网 IP 报 Signaling 类错误
-        assert_eq!(r.check_peer("8.8.8.8:5060").unwrap_err().kind(), ErrorKind::Signaling);
+        assert_eq!(
+            r.check_peer("8.8.8.8:5060").unwrap_err().kind(),
+            ErrorKind::Signaling
+        );
         // 非法地址报参数错误
-        assert_eq!(r.check_peer("not-an-ip").unwrap_err().kind(), ErrorKind::InvalidArgument);
+        assert_eq!(
+            r.check_peer("not-an-ip").unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
     }
 
     #[test]
     fn intranet_peer_can_join_and_leave() {
         let r = router();
         let join = br#"{"peer":"192.168.0.42:5060","peer_id":"p1"}"#;
-        assert_eq!(post(&r, "/room/meeting/join", join).status(), StatusCode::OK);
+        assert_eq!(
+            post(&r, "/room/meeting/join", join).status(),
+            StatusCode::OK
+        );
 
         let peers: serde_json::Value =
             serde_json::from_str(&get(&r, "/room/meeting/peers").into_body()).unwrap();
         assert_eq!(peers["peers"].as_array().unwrap().len(), 1);
         assert_eq!(peers["peers"][0]["address"], "192.168.0.42:5060");
 
-        assert_eq!(post(&r, "/room/meeting/leave", join).status(), StatusCode::OK);
+        assert_eq!(
+            post(&r, "/room/meeting/leave", join).status(),
+            StatusCode::OK
+        );
         let peers: serde_json::Value =
             serde_json::from_str(&get(&r, "/room/meeting/peers").into_body()).unwrap();
         assert_eq!(peers["peers"].as_array().unwrap().len(), 0);
@@ -600,7 +634,10 @@ mod tests {
     #[test]
     fn malformed_body_reports_bad_request() {
         let r = router();
-        assert_eq!(post(&r, "/room/m/join", b"not json").status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post(&r, "/room/m/join", b"not json").status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

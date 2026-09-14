@@ -1,0 +1,31 @@
+[package]
+name = "qm-cluster"
+description = "QuickMeet 分布式集群层：NATS 房间状态同步 + 最低负载调度 + 健康检查与故障迁移"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+qm-common = { path = "../qm-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+# NATS 客户端（core NATS，不启用 jetstream / kv / websockets）。
+# 固定 0.37.0：这是 async-nats 里最后一个**不依赖 tokio-websockets** 的版本，
+# MSRV 1.75 可编译。0.38 起改为强制依赖 tokio-websockets 0.10（rust-version = 1.79），
+# 即使 `default-features = false` 也装不进 1.75；0.46/0.50 又各自声明
+# rust-version = 1.79 / 1.88，都直接编不过验收标准 1。
+async-nats = { version = "=0.37.0", default-features = false, features = ["ring"] }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[features]
+default = []

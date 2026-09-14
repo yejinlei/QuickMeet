@@ -22,7 +22,7 @@ use crate::codec::Codec;
 use crate::codec_id::{CodecId, OPUS_FRAME_20MS_SAMPLES, OPUS_SAMPLE_RATE};
 use crate::frame::Frame;
 use crate::registry::{implementation_report, supported_codecs};
-use crate::rtp::{marshal, unmarshal, unpack, RTP_HEADER_LEN, MediaStream, RtpPacket};
+use crate::rtp::{marshal, unmarshal, unpack, MediaStream, RtpPacket, RTP_HEADER_LEN};
 
 /// 视频测试画面宽度。
 pub const VIDEO_WIDTH: u32 = 640;
@@ -178,17 +178,18 @@ pub fn verify(codec: CodecId, frames: u32) -> Result<RoundTrip> {
     let dec = Codec::new(codec)?;
     let mut received = Vec::with_capacity(payloads.len());
     for (i, pkt) in payloads.iter().enumerate() {
-        let frame = dec
-            .decode(pkt)?
-            .ok_or_else(|| Error::Codec {
-                codec: codec.to_string(),
-                message: format!("第 {i} 个载荷包不足以还原一帧"),
-            })?;
+        let frame = dec.decode(pkt)?.ok_or_else(|| Error::Codec {
+            codec: codec.to_string(),
+            message: format!("第 {i} 个载荷包不足以还原一帧"),
+        })?;
         received.push(frame);
     }
 
     let lossless = source.len() == received.len()
-        && source.iter().zip(received.iter()).all(|(a, b)| frames_equal(a, b));
+        && source
+            .iter()
+            .zip(received.iter())
+            .all(|(a, b)| frames_equal(a, b));
 
     Ok(RoundTrip {
         codec,
@@ -212,12 +213,18 @@ pub fn verify(codec: CodecId, frames: u32) -> Result<RoundTrip> {
 
 /// 验证全部已注册 codec。
 pub fn run_all() -> Result<Vec<RoundTrip>> {
-    supported_codecs().into_iter().map(|c| verify(c, DEFAULT_FRAMES)).collect()
+    supported_codecs()
+        .into_iter()
+        .map(|c| verify(c, DEFAULT_FRAMES))
+        .collect()
 }
 
 /// 验证全部 codec，指定帧数。
 pub fn run_all_frames(frames: u32) -> Result<Vec<RoundTrip>> {
-    supported_codecs().into_iter().map(|c| verify(c, frames)).collect()
+    supported_codecs()
+        .into_iter()
+        .map(|c| verify(c, frames))
+        .collect()
 }
 
 /// 渲染成可直接贴进 PR / 评论区的文本报告。
@@ -226,9 +233,22 @@ pub fn render(reports: &[RoundTrip]) -> String {
     out.push_str("QuickMeet codec 收发兼容验证\n");
     out.push_str(&format!(
         "{:<7} {:<20} {:>4} {:>8} {:>5} {:>5} {:>10} {:>10} {:>6}\n",
-        "codec", "implementation", "pt", "clock", "sent", "recv", "bytes_in", "bytes_wire", "verdict"
+        "codec",
+        "implementation",
+        "pt",
+        "clock",
+        "sent",
+        "recv",
+        "bytes_in",
+        "bytes_wire",
+        "verdict"
     ));
-    out.push_str(&format!("{} {} {:>10}\n", "─────".repeat(7), "─────".repeat(20), "─────".repeat(6)));
+    out.push_str(&format!(
+        "{} {} {:>10}\n",
+        "─────".repeat(7),
+        "─────".repeat(20),
+        "─────".repeat(6)
+    ));
     for r in reports {
         out.push_str(&format!(
             "{:<7} {:<20} {:>4} {:>8} {:>5} {:>5} {:>10} {:>10} {:>6}\n",
@@ -252,7 +272,10 @@ mod tests {
 
     fn assert_pass(r: &RoundTrip) {
         assert_eq!(r.frames_sent, r.frames_received, "收发帧数应一致");
-        assert_eq!(r.rtp_headers_checked, r.frames_sent, "所有 RTP 包头部应一致");
+        assert_eq!(
+            r.rtp_headers_checked, r.frames_sent,
+            "所有 RTP 包头部应一致"
+        );
         assert!(r.lossless, "收发必须无损");
         assert!(r.deterministic, "收发必须可复现");
         assert!(r.integrity_guarded, "篡改载荷必须被拒绝");

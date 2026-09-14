@@ -117,12 +117,7 @@ impl TrackRegistry {
     }
 
     /// 发布一条新轨道（返回轨道 ID）。
-    pub fn publish(
-        &mut self,
-        room_id: &str,
-        publisher: &str,
-        kind: TrackKind,
-    ) -> TrackId {
+    pub fn publish(&mut self, room_id: &str, publisher: &str, kind: TrackKind) -> TrackId {
         let id = uuid::Uuid::new_v4().to_string();
         let track = Track::new(id.clone(), room_id.to_string(), publisher.to_string(), kind);
         self.rooms
@@ -147,7 +142,9 @@ impl TrackRegistry {
             .ok_or_else(|| format!("轨道不存在: room={room_id} track={track_id}"))?;
         // 不能订阅自己发布的轨道（SFU 不做环回）。
         if track.publisher == subscriber {
-            return Err(format!("不能订阅自己发布的轨道: peer={subscriber} track={track_id}"));
+            return Err(format!(
+                "不能订阅自己发布的轨道: peer={subscriber} track={track_id}"
+            ));
         }
         Ok(track.subscribe(subscriber))
     }
@@ -240,7 +237,11 @@ impl TrackRegistry {
     pub fn tracks_by_subscriber(&self, room_id: &str, subscriber: &str) -> Vec<&Track> {
         self.rooms
             .get(room_id)
-            .map(|r| r.values().filter(|t| t.has_subscriber(subscriber)).collect())
+            .map(|r| {
+                r.values()
+                    .filter(|t| t.has_subscriber(subscriber))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -251,7 +252,9 @@ impl TrackRegistry {
 
     /// 获取轨道（可变）。
     pub fn get_track_mut(&mut self, room_id: &str, track_id: &str) -> Option<&mut Track> {
-        self.rooms.get_mut(room_id).and_then(|r| r.get_mut(track_id))
+        self.rooms
+            .get_mut(room_id)
+            .and_then(|r| r.get_mut(track_id))
     }
 
     /// 房间轨道数。

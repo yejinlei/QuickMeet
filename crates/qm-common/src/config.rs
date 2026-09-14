@@ -4,7 +4,7 @@
 //   1. `config/default.toml`（内网 192.168.0.0/24、媒体端口 8080 默认值）
 //   2. `config/local.json`（可选，存在才加载，用于本机/私有化现场覆盖）
 //   3. 环境变量 `QM_XXX_YYY`（覆盖 `xxx.yyy`，现场应急覆盖，无需改文件）
-// 
+//
 //// 所有字段都有默认值，加载失败只在"显式指定的文件不存在"时返回 [`ErrorKind::ConfigLoad`]。
 
 use once_cell::sync::Lazy;
@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     pub storage: StorageConfig,
     pub ai: AiConfig,
+    pub cluster: ClusterConfig,
 }
 
 impl Default for AppConfig {
@@ -31,6 +32,7 @@ impl Default for AppConfig {
             logging: LoggingConfig::default(),
             storage: StorageConfig::default(),
             ai: AiConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -155,6 +157,190 @@ impl Default for AiConfig {
     }
 }
 
+/// 节点角色：集群内一个节点可以是全功能媒体节点，也可以是只发流的旁听分发节点。
+///
+/// 旁听节点不建入站 PeerConnection，只把远端房间状态缓存下来并向下发单向流，
+/// 因此可以承接远大于全功能节点的只收流参会者数量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// 全功能媒体节点：既收流也转发，参与房间调度候选。
+    #[default]
+    Full,
+    /// 旁听分发节点：只转发已存在的远端房间，媒体容量按旁听权重折算。
+    Listener,
+}
+
+impl NodeRole {
+    /// 容错解析：配置里写成 `full` / `listener` / `FULL` 都认，拼写错误才报错。
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "full" | "media" => Ok(NodeRole::Full),
+            "listener" | "listeners" => Ok(NodeRole::Listener),
+            other => Err(Error::config(format!(
+                "cluster.node_role 取值非法: {other}（合法值：full / listener）"
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeRole::Full => "full",
+            NodeRole::Listener => "listener",
+        }
+    }
+}
+
+/// 分布式集群配置（QM-006）。
+///
+/// 所有地址都必须落在 [`NetworkConfig::cidrs`] 声明的内网网段内（全局约束 3/5），
+/// NATS 集群用于房间状态跨节点同步、会议调度与健康检查心跳。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// NATS 服务端地址；必须是内网地址，不接受公网域名。
+    pub server: String,
+    /// NATS 客户端端口。
+    pub port: u16,
+    /// 集群标识：同名集群才共享房间状态与调度视图。
+    pub cluster_id: String,
+    /// 本节点唯一标识，写入心跳与房间归属。
+    pub node_id: String,
+    /// 对外通告的媒体地址，供旁听节点回源拉流（内网地址）。
+    pub advertised_addr: String,
+    /// 本节点角色：`full`（全功能）或 `listener`（旁听分发）。
+    pub node_role: NodeRole,
+    /// 健康检查心跳间隔（秒）。
+    pub heartbeat_secs: u64,
+    /// 连续错过该次数心跳即判定节点故障。
+    pub unhealthy_misses: u64,
+    /// 判定故障后，多久内必须完成会议迁移（秒）。
+    pub failover_target_secs: u64,
+    /// 新节点上线后，多久内必须完成加入并开始承接新会议（秒）。
+    pub join_target_secs: u64,
+    /// 单次 NATS 请求超时（秒）：用于房间状态查询与迁移命令回包。
+    pub request_timeout_secs: u64,
+    /// 单节点最多承载的会议数（调度上限）。
+    pub max_rooms_per_node: usize,
+    /// 单节点旁听参会者预估上限（10000 人旁听的容量口径）。
+    pub listener_capacity: usize,
+    /// 单条上行流按多少倍只收流观众折算媒体容量。
+    pub listener_fanout: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            server: "127.0.0.1".to_string(),
+            port: 4222,
+            cluster_id: "quickmeet".to_string(),
+            node_id: "node-1".to_string(),
+            advertised_addr: "192.168.0.10:8080".to_string(),
+            node_role: NodeRole::default(),
+            heartbeat_secs: 5,
+            unhealthy_misses: 2,
+            failover_target_secs: 10,
+            join_target_secs: 30,
+            request_timeout_secs: 3,
+            max_rooms_per_node: 64,
+            listener_capacity: 20_000,
+            listener_fanout: 200,
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// 由配置推导的旁听容量权重：一条上行流按 `listener_fanout` 折算成观众槽位。
+    pub fn listener_weight(&self) -> u64 {
+        let fanout = self.listener_fanout.max(1) as u64;
+        let cap = self.listener_capacity.max(1) as u64;
+        (fanout * cap).max(1)
+    }
+
+    /// 本节点是否可被调度（旁听节点不可作为调度目标，只承接已分配房间的转发）。
+    pub fn is_schedulable(&self) -> bool {
+        self.node_role != NodeRole::Listener
+    }
+
+    /// 集群配置的启动期校验：所有集群地址必须落在允许的内网网段内。
+    pub fn validate(&self, allowlist: &[Cidr]) -> Result<()> {
+        if self.cluster_id.trim().is_empty() {
+            return Err(Error::config("cluster.cluster_id 不能为空"));
+        }
+        if self.node_id.trim().is_empty() {
+            return Err(Error::config("cluster.node_id 不能为空（集群内必须唯一）"));
+        }
+        if self.port == 0 {
+            return Err(Error::config("cluster.port 不能为 0"));
+        }
+        if self.heartbeat_secs == 0 || self.unhealthy_misses == 0 {
+            return Err(Error::config(
+                "cluster.heartbeat_secs / unhealthy_misses 不能为 0",
+            ));
+        }
+        if self.failover_target_secs == 0 || self.join_target_secs == 0 {
+            return Err(Error::config(
+                "cluster.failover_target_secs / join_target_secs 不能为 0",
+            ));
+        }
+        if self.request_timeout_secs == 0 || self.request_timeout_secs >= self.heartbeat_secs {
+            return Err(Error::config(
+                "cluster.request_timeout_secs 必须大于 0 且小于 cluster.heartbeat_secs",
+            ));
+        }
+        // 私有化硬约束：NATS 与媒体回源地址都只能是内网地址，越界直接拒绝。
+        //
+        // 唯一的例外是**回环地址**：`127.0.0.1` 是 docker-compose 把 NATS 端口映射到
+        // 宿主后的典型写法（NATS sidecar 与本节点同机部署），回环流量不离开本机，
+        // 因此不违反数据不出域；非回环地址一律要求落在 cidrs 允许网段内。
+        let (server_ip, _) = parse_host_port(&self.server, self.port, "cluster.server")?;
+        if !server_ip.is_loopback() {
+            Error::ensure_private_host(server_ip, allowlist)?;
+        }
+        let advertised = self.advertised_addr.split_once(':').ok_or_else(|| {
+            Error::config(format!(
+                "cluster.advertised_addr 需要 host:port 形式: {}",
+                self.advertised_addr
+            ))
+        })?;
+        let advertised_ip: std::net::IpAddr = advertised.0.parse().map_err(|e| {
+            Error::config(format!(
+                "cluster.advertised_addr 主机名非法（需 IPv4）: {}: {e}",
+                advertised.0
+            ))
+        })?;
+        if !advertised_ip.is_loopback() {
+            Error::ensure_private_host(advertised_ip, allowlist)?;
+        }
+        Ok(())
+    }
+}
+
+/// 解析 `host:port` 形式的地址字符串，返回 (IPv4, port)。
+///
+/// 集群配置只接受 IPv4：内网 CIDR 判定（[`Cidr`]）只实现 v4，接受域名或 v6 会让
+/// 校验形同虚设。
+fn parse_host_port(host: &str, port: u16, label: &str) -> Result<(std::net::IpAddr, u16)> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(Error::config(format!("{label} 不能为空")));
+    }
+    if port == 0 {
+        return Err(Error::config(format!("{label} 端口不能为 0")));
+    }
+    let ip: std::net::IpAddr = host.parse().map_err(|e| {
+        Error::config(format!(
+            "{label} 需 IPv4 地址（不接受域名或 IPv6）: {host}: {e}"
+        ))
+    })?;
+    if ip.is_ipv6() {
+        return Err(Error::config(format!(
+            "{label} 需 IPv4 地址（不接受 IPv6）: {host}"
+        )));
+    }
+    Ok((ip, port))
+}
+
 /// 配置来源，便于在日志/调试中追踪某个值从哪来。
 #[derive(Debug, Default)]
 pub struct ConfigSource {
@@ -243,12 +429,16 @@ impl AppConfig {
             return Err(Error::config("media.signaling_port 不能为 0"));
         }
         if self.network.cidrs.is_empty() {
-            return Err(Error::config("network.cidrs 不能为空（私有化部署需声明允许的内网网段）"));
+            return Err(Error::config(
+                "network.cidrs 不能为空（私有化部署需声明允许的内网网段）",
+            ));
         }
         self.network.parsed_cidrs()?;
         if self.logging.level.is_empty() {
             return Err(Error::config("logging.level 不能为空"));
         }
+        let cidrs = self.network.parsed_cidrs()?;
+        self.cluster.validate(&cidrs)?;
         Ok(())
     }
 }
@@ -306,11 +496,30 @@ fn env_overrides_map() -> Result<serde_json::Map<String, serde_json::Value>> {
 fn known_section(section: &str, field: &str) -> bool {
     matches!(
         (section, field),
-        ("media", "port" | "max_participants" | "idle_timeout_secs" | "signaling_port")
-            | ("network", "cidrs" | "bind_host")
+        (
+            "media",
+            "port" | "max_participants" | "idle_timeout_secs" | "signaling_port"
+        ) | ("network", "cidrs" | "bind_host")
             | ("logging", "level" | "file_dir" | "json")
             | ("storage", "data_dir" | "encrypted")
             | ("ai", "enabled" | "base_url" | "timeout_ms")
+            | (
+                "cluster",
+                "server"
+                    | "port"
+                    | "cluster_id"
+                    | "node_id"
+                    | "advertised_addr"
+                    | "node_role"
+                    | "heartbeat_secs"
+                    | "unhealthy_misses"
+                    | "failover_target_secs"
+                    | "join_target_secs"
+                    | "request_timeout_secs"
+                    | "max_rooms_per_node"
+                    | "listener_capacity"
+                    | "listener_fanout"
+            )
     )
 }
 
@@ -332,15 +541,14 @@ mod tests {
     fn defaults_match_epic_constraints() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.media.port, 8080, "媒体服务默认监听 8080");
-        assert!(
-            cfg.network
-                .parsed_cidrs()
-                .unwrap()
-                .iter()
-                .any(|c| c.contains(std::net::IpAddr::V4(
-                    std::net::Ipv4Addr::new(192, 168, 0, 55)
-                )))
-        );
+        assert!(cfg
+            .network
+            .parsed_cidrs()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                192, 168, 0, 55
+            )))));
         assert!(cfg.ai.enabled == false, "AI 能力默认关闭");
         assert!(cfg.validate().is_ok());
     }
@@ -350,6 +558,75 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.network.cidrs.clear();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cluster_defaults_satisfy_acceptance_windows() {
+        let c = AppConfig::default().cluster;
+        // 验收标准 2：节点宕机后 10s 内迁移 —— 判死窗口 = 心跳 × 错过次数。
+        assert_eq!(c.heartbeat_secs.saturating_mul(c.unhealthy_misses), 10);
+        assert_eq!(c.failover_target_secs, 10);
+        // 验收标准 4：新节点 30s 内接入。
+        assert_eq!(c.join_target_secs, 30);
+        // 验收标准 3：旁听容量口径 = fanout × capacity，必须覆盖 10000 人。
+        assert!(
+            c.listener_weight() >= 10_000,
+            "旁听容量 {} 必须覆盖 10000 人",
+            c.listener_weight()
+        );
+        assert!(c.is_schedulable());
+    }
+
+    #[test]
+    fn cluster_validate_accepts_loopback_nats_sidecar() {
+        // docker-compose 把 NATS 映射到宿主后，节点侧看到的地址就是 127.0.0.1：
+        // 回环流量不离开本机，属于合法的私有化部署形态。
+        let cfg = AppConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_validate_rejects_public_addresses() {
+        let cidrs = AppConfig::default().network.parsed_cidrs().unwrap();
+
+        // NATS server 指向公网地址：必须拒绝（数据不得出域）。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "8.8.8.8".to_string();
+        let err = cfg.cluster.validate(&cidrs).unwrap_err();
+        assert!(err.to_string().contains("不在允许的内网网段"), "{err}");
+
+        // 媒体回源地址指向公网地址：必须拒绝。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.advertised_addr = "1.1.1.1:8080".to_string();
+        assert!(cfg.cluster.validate(&cidrs).is_err());
+    }
+
+    #[test]
+    fn cluster_validate_accepts_allowlisted_internal_address() {
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "192.168.0.42".to_string();
+        cfg.cluster.advertised_addr = "192.168.0.42:8080".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_validate_rejects_request_timeout_not_under_heartbeat() {
+        // 请求超时必须小于心跳间隔：否则请求可能挂到下一次心跳之后，
+        // 把「请求超时」和「节点故障」混成一件事。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.request_timeout_secs = cfg.cluster.heartbeat_secs;
+        let cidrs = AppConfig::default().network.parsed_cidrs().unwrap();
+        let err = cfg.cluster.validate(&cidrs).unwrap_err();
+        assert!(err.to_string().contains("request_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn node_role_parses_all_spellings() {
+        assert_eq!(NodeRole::parse("full").unwrap(), NodeRole::Full);
+        assert_eq!(NodeRole::parse("media").unwrap(), NodeRole::Full);
+        assert_eq!(NodeRole::parse("listener").unwrap(), NodeRole::Listener);
+        assert_eq!(NodeRole::parse("LISTENERS").unwrap(), NodeRole::Listener);
+        assert!(NodeRole::parse("router").is_err());
     }
 
     #[test]
@@ -403,13 +680,22 @@ mod tests {
             cfg.media.signaling_port, 8101,
             "media.signaling_port 必须覆盖（split(\"_\") 会把它打成 media.signaling.port 并静默丢弃）"
         );
-        assert_eq!(cfg.network.bind_host, "10.10.10.10", "network.bind_host 必须覆盖");
+        assert_eq!(
+            cfg.network.bind_host, "10.10.10.10",
+            "network.bind_host 必须覆盖"
+        );
         assert_eq!(
             cfg.logging.file_dir, "./target/qm_env_log",
             "logging.file_dir 必须覆盖"
         );
-        assert_eq!(cfg.storage.data_dir, "./target/qm_env_data", "storage.data_dir 必须覆盖");
-        assert_eq!(cfg.ai.base_url, "http://192.168.0.20/v1", "ai.base_url 必须覆盖");
+        assert_eq!(
+            cfg.storage.data_dir, "./target/qm_env_data",
+            "storage.data_dir 必须覆盖"
+        );
+        assert_eq!(
+            cfg.ai.base_url, "http://192.168.0.20/v1",
+            "ai.base_url 必须覆盖"
+        );
         assert_eq!(cfg.ai.timeout_ms, 1234, "ai.timeout_ms 必须覆盖");
 
         // 未设置的环境变量必须保持默认值，不能被上面的键污染。
@@ -424,10 +710,7 @@ mod tests {
         // 结果是配置加载直接失败（`invalid type: found map, expected a sequence`）。
         let _g = ENV_LOCK.lock();
         std::fs::create_dir_all("./target/config_env_nested").unwrap();
-        std::env::set_var(
-            "QM_NETWORK_CIDRS",
-            r#"["192.168.0.0/24","10.0.0.0/8"]"#,
-        );
+        std::env::set_var("QM_NETWORK_CIDRS", r#"["192.168.0.0/24","10.0.0.0/8"]"#);
         let (cfg, _) = load_from("./target/config_env_nested").unwrap();
         std::env::remove_var("QM_NETWORK_CIDRS");
         assert_eq!(cfg.network.cidrs.len(), 2, "整段 JSON 数组必须替换默认网段");
@@ -454,11 +737,16 @@ mod tests {
             "#
             .into(),
         ))
-        .join(figment::providers::Serialized::defaults(AppConfig::default()))
+        .join(figment::providers::Serialized::defaults(
+            AppConfig::default(),
+        ))
         .extract()
         .unwrap();
         assert_eq!(cfg.media.port, 8085, "内联 TOML 必须覆盖默认端口");
-        assert_eq!(cfg.network.bind_host, "192.168.0.10", "未声明字段回落默认值");
+        assert_eq!(
+            cfg.network.bind_host, "192.168.0.10",
+            "未声明字段回落默认值"
+        );
         assert_eq!(cfg.network.cidrs.len(), 2);
         assert_eq!(cfg.network.parsed_cidrs().unwrap().len(), 2);
     }

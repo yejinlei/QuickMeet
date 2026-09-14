@@ -20,7 +20,8 @@ impl Run {
 }
 
 fn read_u32(buf: &[u8]) -> Option<u32> {
-    buf.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    buf.get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// 把平坦/斜纹平面压成游程记录（确定性，可精确还原）。
@@ -106,7 +107,10 @@ mod tests {
     fn rle_round_trip_uniform_and_patterned() {
         let uniform = vec![42u8; 10_000];
         assert_eq!(rle_decode(&rle_encode(&uniform)).unwrap(), uniform);
-        assert!(rle_encode(&uniform).len() < uniform.len(), "均匀平面应显著压缩");
+        assert!(
+            rle_encode(&uniform).len() < uniform.len(),
+            "均匀平面应显著压缩"
+        );
 
         let mut patterned = Vec::new();
         for i in 0..4096u32 {

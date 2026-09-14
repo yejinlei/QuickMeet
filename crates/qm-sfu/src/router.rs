@@ -17,11 +17,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::capacity::{render_report, simulate_capacity, CapacityConfig};
 use crate::forwarding::{simulate_forward_batch, ForwardDecision, ForwardStats};
-use crate::ice::{simulate_nat, select_ice_servers, IceConfig, NatType};
-use crate::recovery::{NackCache, NackRequest, RecoveryMode, simulate_loss_recovery, FecGroup};
 use crate::hwaccel::select_codec_path;
-use crate::capacity::{CapacityConfig, simulate_capacity, render_report};
+use crate::ice::{select_ice_servers, simulate_nat, IceConfig, NatType};
+use crate::recovery::{simulate_loss_recovery, FecGroup, NackCache, NackRequest, RecoveryMode};
 use crate::track::{Track, TrackKind, TrackRegistry, TrackState};
 
 /// SFU 路由结果。
@@ -33,10 +33,16 @@ pub struct SfuRouteResult {
 
 impl SfuRouteResult {
     pub fn ok(body: &str) -> Self {
-        Self { status: 200, body: body.to_string() }
+        Self {
+            status: 200,
+            body: body.to_string(),
+        }
     }
     pub fn err(status: u16, msg: &str) -> Self {
-        Self { status, body: msg.to_string() }
+        Self {
+            status,
+            body: msg.to_string(),
+        }
     }
     pub fn ok_json(v: &impl Serialize) -> Self {
         Self::ok(&serde_json::to_string(v).unwrap_or_default())
@@ -54,7 +60,7 @@ impl SfuRouteResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublishBody {
     pub peer: String,
-    pub kind: String,  // "audio" or "video"
+    pub kind: String, // "audio" or "video"
 }
 
 /// 订阅/退订请求体。
@@ -285,12 +291,19 @@ impl SfuRouter {
     fn publish(&self, room: &str, body: &[u8]) -> SfuRouteResult {
         let m: PublishBody = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => return SfuRouteResult::err_json(400, &format!("publish 请求体解析失败: {e}")),
+            Err(e) => {
+                return SfuRouteResult::err_json(400, &format!("publish 请求体解析失败: {e}"))
+            }
         };
         let kind = match m.kind.as_str() {
             "audio" => TrackKind::Audio,
             "video" => TrackKind::Video,
-            _ => return SfuRouteResult::err_json(400, &format!("kind 必须是 audio 或 video, 得到: {}", m.kind)),
+            _ => {
+                return SfuRouteResult::err_json(
+                    400,
+                    &format!("kind 必须是 audio 或 video, 得到: {}", m.kind),
+                )
+            }
         };
         let mut reg = self.tracks.lock();
         let track_id = reg.publish(room, &m.peer, kind);
@@ -307,7 +320,9 @@ impl SfuRouter {
     fn subscribe(&self, room: &str, body: &[u8]) -> SfuRouteResult {
         let m: SubscribeBody = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => return SfuRouteResult::err_json(400, &format!("subscribe 请求体解析失败: {e}")),
+            Err(e) => {
+                return SfuRouteResult::err_json(400, &format!("subscribe 请求体解析失败: {e}"))
+            }
         };
         let mut reg = self.tracks.lock();
         match reg.subscribe(room, &m.track_id, &m.peer) {
@@ -333,7 +348,9 @@ impl SfuRouter {
     fn unsubscribe(&self, room: &str, body: &[u8]) -> SfuRouteResult {
         let m: SubscribeBody = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => return SfuRouteResult::err_json(400, &format!("unsubscribe 请求体解析失败: {e}")),
+            Err(e) => {
+                return SfuRouteResult::err_json(400, &format!("unsubscribe 请求体解析失败: {e}"))
+            }
         };
         let mut reg = self.tracks.lock();
         match reg.unsubscribe(room, &m.track_id, &m.peer) {
@@ -359,7 +376,9 @@ impl SfuRouter {
     fn forward(&self, room: &str, body: &[u8]) -> SfuRouteResult {
         let m: ForwardBody = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => return SfuRouteResult::err_json(400, &format!("forward 请求体解析失败: {e}")),
+            Err(e) => {
+                return SfuRouteResult::err_json(400, &format!("forward 请求体解析失败: {e}"))
+            }
         };
         let reg = self.tracks.lock();
         let track_refs: Vec<&Track> = reg.room_tracks(room);
@@ -425,7 +444,13 @@ impl SfuRouter {
             "video" => TrackKind::Video,
             _ => return SfuRouteResult::err_json(400, "kind must be audio or video"),
         };
-        let nack_req = NackRequest::new(&req.track_id, kind, &req.publisher, req.lost_sequences, req.tick);
+        let nack_req = NackRequest::new(
+            &req.track_id,
+            kind,
+            &req.publisher,
+            req.lost_sequences,
+            req.tick,
+        );
         let mut cache = NackCache::new();
         for cs in &req.cached_packets {
             cache.record(cs.0, cs.1, cs.2, cs.3);
@@ -454,7 +479,9 @@ impl SfuRouter {
             group.add_media(*seq, payload);
         }
         match group.generate_redundancy() {
-            Some(fec) => SfuRouteResult::ok_json(&serde_json::json!({"ok": true, "fec_packet": fec})),
+            Some(fec) => {
+                SfuRouteResult::ok_json(&serde_json::json!({"ok": true, "fec_packet": fec}))
+            }
             None => SfuRouteResult::err_json(400, "FEC group empty"),
         }
     }
@@ -482,13 +509,12 @@ impl SfuRouter {
     }
 
     fn hwaccel_info(&self, _room: &str) -> SfuRouteResult {
-        let path = select_codec_path(
-            "h264",
-            TrackKind::Video,
-            &|b: crate::hwaccel::HwBackend| {
-                crate::hwaccel::HwAvailability::unavailable(b, "hardware probe not available in sandbox")
-            },
-        );
+        let path = select_codec_path("h264", TrackKind::Video, &|b: crate::hwaccel::HwBackend| {
+            crate::hwaccel::HwAvailability::unavailable(
+                b,
+                "hardware probe not available in sandbox",
+            )
+        });
         SfuRouteResult::ok_json(&serde_json::json!({
             "platform": format!("{:?}", crate::hwaccel::detect_platform()),
             "codec_path": path,
@@ -515,7 +541,6 @@ impl SfuRouter {
             "rendered": text,
         }))
     }
-
 }
 
 impl Default for SfuRouter {
@@ -754,7 +779,8 @@ mod tests {
                 [3, 120, 42, 200],
                 [4, 130, 42, 200]
             ]
-        }).to_string();
+        })
+        .to_string();
         let resp = r.route("POST", "/room/r/nack", body.as_bytes());
         assert!(resp.is_ok(), "nack should succeed: {}", resp.body);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
@@ -773,7 +799,8 @@ mod tests {
             "tick": 0,
             "max_retries": 3,
             "cached_packets": []
-        }).to_string();
+        })
+        .to_string();
         let resp = r.route("POST", "/room/r/nack", body.as_bytes());
         assert_eq!(resp.status, 400);
     }
@@ -791,13 +818,17 @@ mod tests {
                 [1, [4, 5, 6]],
                 [2, [7, 8, 9]]
             ]
-        }).to_string();
+        })
+        .to_string();
         let resp = r.route("POST", "/room/r/fec", body.as_bytes());
         assert!(resp.is_ok(), "fec should succeed: {}", resp.body);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(v["ok"], true);
         assert!(v["fec_packet"]["redundancy_data"].is_array());
-        assert_eq!(v["fec_packet"]["group_sequences"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            v["fec_packet"]["group_sequences"].as_array().unwrap().len(),
+            3
+        );
     }
 
     #[test]
@@ -808,7 +839,8 @@ mod tests {
             "loss_rate": 0.30,
             "mode": "nack_fec",
             "seed": 42
-        }).to_string();
+        })
+        .to_string();
         let resp = r.route("POST", "/room/r/recover", body.as_bytes());
         assert!(resp.is_ok(), "recover should succeed: {}", resp.body);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
@@ -826,7 +858,8 @@ mod tests {
             "loss_rate": 0.1,
             "mode": "invalid",
             "seed": 1
-        }).to_string();
+        })
+        .to_string();
         let resp = r.route("POST", "/room/r/recover", body.as_bytes());
         assert_eq!(resp.status, 400);
     }
@@ -866,7 +899,8 @@ mod tests {
             "bitrate_bps": 4000000,
             "subs_per_stream": 4,
             "recovery_enabled": true
-        }).to_string();
+        })
+        .to_string();
         let resp = r.route("POST", "/room/r/benchmark", body.as_bytes());
         assert!(resp.is_ok());
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();

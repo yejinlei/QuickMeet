@@ -54,7 +54,13 @@ pub struct NackRequest {
 }
 
 impl NackRequest {
-    pub fn new(track_id: &str, kind: TrackKind, publisher: &str, lost: Vec<u16>, tick: u64) -> Self {
+    pub fn new(
+        track_id: &str,
+        kind: TrackKind,
+        publisher: &str,
+        lost: Vec<u16>,
+        tick: u64,
+    ) -> Self {
         Self {
             track_id: track_id.to_string(),
             kind,
@@ -297,10 +303,13 @@ pub fn try_fec_recover(
         return None;
     }
 
-    let max_len = fec
-        .redundancy_data
-        .len()
-        .max(group_received.iter().map(|(_, p)| p.len()).max().unwrap_or(0));
+    let max_len = fec.redundancy_data.len().max(
+        group_received
+            .iter()
+            .map(|(_, p)| p.len())
+            .max()
+            .unwrap_or(0),
+    );
     let mut recovered = vec![0u8; max_len];
     for (i, &b) in fec.redundancy_data.iter().enumerate() {
         recovered[i] ^= b;
@@ -597,7 +606,11 @@ mod tests {
             cache.record(s, s as u32 * 10, 42, 200);
         }
         let req = NackRequest::new("t1", TrackKind::Audio, "alice", vec![1], 0);
-        assert_eq!(cache.handle_nack(&req, 3).len(), 0, "old packets should be evicted");
+        assert_eq!(
+            cache.handle_nack(&req, 3).len(),
+            0,
+            "old packets should be evicted"
+        );
     }
 
     #[test]
@@ -620,12 +633,7 @@ mod tests {
         group.add_media(12, &[0xEE, 0xFF]);
         let fec = group.generate_redundancy().unwrap();
 
-        let result = try_fec_recover(
-            &fec,
-            &[10, 12],
-            &[vec![0xAA, 0xBB], vec![0xEE, 0xFF]],
-            11,
-        );
+        let result = try_fec_recover(&fec, &[10, 12], &[vec![0xAA, 0xBB], vec![0xEE, 0xFF]], 11);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.recovered_sequence, 11);
@@ -683,15 +691,27 @@ mod tests {
         assert_eq!(stats.packets_sent, 1000);
         assert!(stats.packets_lost > 0, "30% loss should have lost packets");
         assert!(stats.fec_recovered > 0, "FEC should recover some losses");
-        assert!(stats.nack_recovered > 0, "NACK should recover remaining losses");
-        assert!(stats.recovery_rate() > 0.9, "recovery rate should exceed 90%");
-        assert!(stats.audio_no_interruption(), "audio unrecoverable rate should be <1%");
+        assert!(
+            stats.nack_recovered > 0,
+            "NACK should recover remaining losses"
+        );
+        assert!(
+            stats.recovery_rate() > 0.9,
+            "recovery rate should exceed 90%"
+        );
+        assert!(
+            stats.audio_no_interruption(),
+            "audio unrecoverable rate should be <1%"
+        );
     }
 
     #[test]
     fn simulate_30pct_loss_video_no_long_stall() {
         let stats = simulate_loss_recovery(1000, 0.30, RecoveryMode::NackFec, 123);
-        assert!(stats.video_no_long_stall(), "video unrecoverable rate should be <5%");
+        assert!(
+            stats.video_no_long_stall(),
+            "video unrecoverable rate should be <5%"
+        );
     }
 
     #[test]

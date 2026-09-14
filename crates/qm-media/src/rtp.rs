@@ -87,20 +87,29 @@ impl MediaStream {
     pub fn push_frame(&mut self, codec: &Codec, frame: &Frame) -> Result<RtpPacket> {
         let pkts = codec.encode(frame)?;
         if pkts.is_empty() {
-            return Err(Error::codec(codec.codec().to_string(), "编码器未产出任何载荷包"));
+            return Err(Error::codec(
+                codec.codec().to_string(),
+                "编码器未产出任何载荷包",
+            ));
         }
         Ok(self.packetize(&pkts[pkts.len() - 1]))
     }
 }
 
 fn truncated() -> Error {
-    Error::Codec { codec: "rtp".into(), message: "RTP 包截断".into() }
+    Error::Codec {
+        codec: "rtp".into(),
+        message: "RTP 包截断".into(),
+    }
 }
 
 /// 序列化 RTP 包为线上字节。
 pub fn marshal(pkt: &RtpPacket) -> Result<Vec<u8>> {
     if pkt.payload_type > 0x7F {
-        return Err(Error::codec("rtp", format!("payload type {} 超过 7 位上限", pkt.payload_type)));
+        return Err(Error::codec(
+            "rtp",
+            format!("payload type {} 超过 7 位上限", pkt.payload_type),
+        ));
     }
     if pkt.ssrc == 0 {
         return Err(Error::codec("rtp", "ssrc 不能为 0（RFC 3550 要求非零）"));
@@ -154,7 +163,10 @@ pub fn unmarshal(data: &[u8]) -> Result<RtpPacket> {
 pub fn unpack(packets: &[RtpPacket]) -> Result<Vec<Packet>> {
     let mut groups: Vec<(u32, u32, Vec<&RtpPacket>)> = Vec::new();
     for p in packets {
-        match groups.iter_mut().find(|g| g.0 == p.ssrc && g.1 == p.timestamp) {
+        match groups
+            .iter_mut()
+            .find(|g| g.0 == p.ssrc && g.1 == p.timestamp)
+        {
             Some(g) => g.2.push(p),
             None => groups.push((p.ssrc, p.timestamp, vec![p])),
         }
@@ -172,7 +184,11 @@ pub fn unpack(packets: &[RtpPacket]) -> Result<Vec<Packet>> {
                 marker = marker || p.marker;
                 fragments += 1;
             }
-            Ok(Packet { data, marker, samples: fragments })
+            Ok(Packet {
+                data,
+                marker,
+                samples: fragments,
+            })
         })
         .collect()
 }
@@ -196,7 +212,11 @@ mod tests {
     #[test]
     fn rtp_marshal_unmarshal_round_trip() {
         let mut stream = MediaStream::new(CodecId::Vp8, 0x1234_5678);
-        let pkt = stream.packetize(&Packet { data: vec![1, 2, 3, 4, 5], marker: true, samples: 1 });
+        let pkt = stream.packetize(&Packet {
+            data: vec![1, 2, 3, 4, 5],
+            marker: true,
+            samples: 1,
+        });
         let wire = marshal(&pkt).unwrap();
         assert_eq!(wire.len(), RTP_HEADER_LEN + 5);
         let back = unmarshal(&wire).unwrap();
@@ -205,7 +225,11 @@ mod tests {
         assert_eq!(wire[0] >> 6, 2, "版本位应为 v2");
         assert_eq!(wire[0] & 0x3F, 0, "P / X / CC 必须为 0");
         assert_ne!(wire[1] & 0x80, 0, "marker 应落在 byte1 的 MSB");
-        assert_eq!(wire[1] & 0x7F, pkt.payload_type, "payload type 占 byte1 低 7 位");
+        assert_eq!(
+            wire[1] & 0x7F,
+            pkt.payload_type,
+            "payload type 占 byte1 低 7 位"
+        );
     }
 
     #[test]
@@ -222,27 +246,61 @@ mod tests {
 
     #[test]
     fn rtp_rejects_zero_ssrc_and_bad_pt() {
-        let p = RtpPacket { ssrc: 0, payload_type: 96, ..mk() };
+        let p = RtpPacket {
+            ssrc: 0,
+            payload_type: 96,
+            ..mk()
+        };
         assert!(marshal(&p).is_err());
-        let p2 = RtpPacket { ssrc: 1, payload_type: 200, ..mk() };
+        let p2 = RtpPacket {
+            ssrc: 1,
+            payload_type: 200,
+            ..mk()
+        };
         assert!(marshal(&p2).is_err());
     }
 
     #[test]
     fn stream_advances_seq_and_ts() {
         let mut s = MediaStream::new(CodecId::Vp8, 1);
-        let a = s.packetize(&Packet { data: vec![0], marker: true, samples: crate::codec_id::VIDEO_TS_STEP as u32 });
-        let b = s.packetize(&Packet { data: vec![0], marker: true, samples: 1 });
+        let a = s.packetize(&Packet {
+            data: vec![0],
+            marker: true,
+            samples: crate::codec_id::VIDEO_TS_STEP as u32,
+        });
+        let b = s.packetize(&Packet {
+            data: vec![0],
+            marker: true,
+            samples: 1,
+        });
         assert_eq!(a.sequence_number, 0);
         assert_eq!(b.sequence_number, 1);
-        assert_eq!(b.timestamp - a.timestamp, crate::codec_id::VIDEO_TS_STEP as u32);
+        assert_eq!(
+            b.timestamp - a.timestamp,
+            crate::codec_id::VIDEO_TS_STEP as u32
+        );
     }
 
     #[test]
     fn unpack_groups_by_timestamp_and_seq() {
-        let p1 = RtpPacket { sequence_number: 3, ssrc: 7, timestamp: 100, ..mk() };
-        let p2 = RtpPacket { sequence_number: 2, ssrc: 7, timestamp: 100, ..mk() };
-        let p3 = RtpPacket { sequence_number: 5, ssrc: 7, timestamp: 200, ..mk() };
+        let p1 = RtpPacket {
+            sequence_number: 3,
+            ssrc: 7,
+            timestamp: 100,
+            ..mk()
+        };
+        let p2 = RtpPacket {
+            sequence_number: 2,
+            ssrc: 7,
+            timestamp: 100,
+            ..mk()
+        };
+        let p3 = RtpPacket {
+            sequence_number: 5,
+            ssrc: 7,
+            timestamp: 200,
+            ..mk()
+        };
         let (b1, b2, b3) = (p1.payload.len(), p2.payload.len(), p3.payload.len());
         let out = unpack(&[p3, p1, p2]).unwrap();
         assert_eq!(out.len(), 2);

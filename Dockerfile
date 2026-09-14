@@ -34,5 +34,7 @@ USER 1000
 # 媒体服务默认监听 8080（Epic 全局约束），信令 8081。
 EXPOSE 8080 8081
 
-# 默认跑编解码收发验证；带 --signal 才起信令服务。
+# 默认跑编解码收发验证；带 --signal 才起信令服务，带 --cluster 进集群模式。
+# 集群参数由 docker-compose.yml 的 media 服务显式传（见那边的 command:），
+# 不写在这里 —— CMD 只是默认值，三个节点必须各自带 --cluster 才会互认识。
 CMD ["./target/release/qm-demo", "--bind", "0.0.0.0"]

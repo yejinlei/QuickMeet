@@ -2,7 +2,6 @@
 //!
 //! 接入真实编解码器时只改这里，业务层与验证代码无需改动。
 
-
 use qm_common::error::{Error, Result};
 
 use crate::codec::{Decoder, Encoder};
@@ -56,7 +55,10 @@ pub fn implementation_report() -> Vec<(CodecId, &'static str)> {
 
 /// 未实现的编解码统一报错（预留扩展位）。
 pub fn unsupported(name: &str) -> Error {
-    Error::Codec { codec: name.to_string(), message: "该编解码尚未接入实现".to_string() }
+    Error::Codec {
+        codec: name.to_string(),
+        message: "该编解码尚未接入实现".to_string(),
+    }
 }
 
 #[cfg(test)]

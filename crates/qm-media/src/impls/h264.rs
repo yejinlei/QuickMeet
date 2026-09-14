@@ -10,12 +10,11 @@
 //! 与真实后端一致，验收标准 3 的收发兼容性结论同样适用；
 //! 码率/PSNR 指标需接真实 OpenH264（`--features native-h264`）后复测。
 
-
 use crate::bitstream::{checksum, push_u16, push_u32, rle_decode, rle_encode, take_u16, take_u32};
 use crate::codec::{Decoder, Encoder};
 use crate::codec_id::CodecId;
-use crate::frame::{Frame, Packet};
 use crate::codec_id::{VIDEO_CLOCK_HZ, VIDEO_TS_STEP};
+use crate::frame::{Frame, Packet};
 use qm_common::error::{Error, Result};
 
 /// H.264 载荷魔数。
@@ -42,7 +41,10 @@ struct H264Decoder {
 }
 
 fn err(message: impl Into<String>) -> Error {
-    Error::Codec { codec: "h264".into(), message: message.into() }
+    Error::Codec {
+        codec: "h264".into(),
+        message: message.into(),
+    }
 }
 
 impl Encoder for H264Encoder {
@@ -91,7 +93,11 @@ impl Encoder for H264Encoder {
         self.ts = (self.ts + VIDEO_TS_STEP) % VIDEO_CLOCK_HZ as u64;
         self.nalu_seq = self.nalu_seq.wrapping_add(1);
         self.encoded += 1;
-        Ok(vec![Packet { data, marker: true, samples: 1 }])
+        Ok(vec![Packet {
+            data,
+            marker: true,
+            samples: 1,
+        }])
     }
 
     fn encoded_frames(&self) -> u64 {
@@ -113,7 +119,11 @@ impl Decoder for H264Decoder {
             return Err(err(format!("不支持的 H.264 载荷版本 {}", d[2])));
         }
         if d.len() < header_len() {
-            return Err(err(format!("载荷长度 {} 小于头长 {}", d.len(), header_len())));
+            return Err(err(format!(
+                "载荷长度 {} 小于头长 {}",
+                d.len(),
+                header_len()
+            )));
         }
         let idr = d[3] & FLAG_IDR != 0;
         let w = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
@@ -125,7 +135,9 @@ impl Decoder for H264Decoder {
         let body = &d[header_len()..];
         let got_crc = checksum(body);
         if want_crc != got_crc {
-            return Err(err(format!("载荷 CRC 校验失败：期望 0x{want_crc:08x}，实际 0x{got_crc:08x}")));
+            return Err(err(format!(
+                "载荷 CRC 校验失败：期望 0x{want_crc:08x}，实际 0x{got_crc:08x}"
+            )));
         }
 
         let y_size = take_u32(body).ok_or_else(|| err("载荷截断：缺少平面长度"))? as usize;
@@ -155,8 +167,11 @@ impl Decoder for H264Decoder {
 
 fn read_plane(body: &[u8], p: &mut usize, expect: usize) -> Result<Vec<u8>> {
     let off = *p;
-    let n_runs = take_u32(body.get(off..).ok_or_else(|| err("载荷截断：平面记录缺失"))?)
-            .ok_or_else(|| err("载荷截断：平面游程数缺失"))? as usize;
+    let n_runs = take_u32(
+        body.get(off..)
+            .ok_or_else(|| err("载荷截断：平面记录缺失"))?,
+    )
+    .ok_or_else(|| err("载荷截断：平面游程数缺失"))? as usize;
     let mut q = off + 4;
     for _ in 0..n_runs {
         if body.get(q..q.saturating_add(5)).is_none() {
@@ -166,14 +181,21 @@ fn read_plane(body: &[u8], p: &mut usize, expect: usize) -> Result<Vec<u8>> {
     }
     let got = rle_decode(&body[off..q]).ok_or_else(|| err("载荷损坏：游程解码失败"))?;
     if got.len() != expect {
-        return Err(err(format!("平面长度不匹配：期望 {expect} 字节，实际 {} 字节", got.len())));
+        return Err(err(format!(
+            "平面长度不匹配：期望 {expect} 字节，实际 {} 字节",
+            got.len()
+        )));
     }
     *p = q;
     Ok(got)
 }
 
 pub fn new_encoder() -> Box<dyn Encoder> {
-    Box::new(H264Encoder { encoded: 0, ts: 0, nalu_seq: 0 })
+    Box::new(H264Encoder {
+        encoded: 0,
+        ts: 0,
+        nalu_seq: 0,
+    })
 }
 
 pub fn new_decoder() -> Box<dyn Decoder> {
@@ -189,7 +211,11 @@ mod tests {
         let frames: Vec<Frame> = (0..5u32)
             .map(|i| Frame::synthetic_video(640, 480, i, i == 0))
             .collect();
-        let mut enc = H264Encoder { encoded: 0, ts: 0, nalu_seq: 0 };
+        let mut enc = H264Encoder {
+            encoded: 0,
+            ts: 0,
+            nalu_seq: 0,
+        };
         let mut dec = H264Decoder { decoded: 0 };
         for f in &frames {
             let p = enc.encode(f).unwrap();
@@ -203,7 +229,11 @@ mod tests {
 
     #[test]
     fn h264_header_offsets_match_writer() {
-        let mut enc = H264Encoder { encoded: 0, ts: 0, nalu_seq: 0 };
+        let mut enc = H264Encoder {
+            encoded: 0,
+            ts: 0,
+            nalu_seq: 0,
+        };
         // 关键帧 / 非关键帧各一帧：SPS / PPS 序号只在关键帧携带。
         let f0 = Frame::synthetic_video(640, 480, 0, true);
         let f1 = Frame::synthetic_video(640, 480, 1, false);
