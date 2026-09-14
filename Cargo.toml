@@ -26,6 +26,15 @@ repository = "https://github.com/yejinlei/QuickMeet"
 
 [workspace.dependencies]
 # --- 核心 WebRTC ---
+# webrtc 0.17.1 声明 webrtc-sctp = "0.17.1"（即 ^0.17.1），Cargo 会解析到 0.17.2。
+# 0.17.2 给 association::Config 新增了 mtu 字段，而 webrtc 0.17.1 的
+# sctp_transport 仍按旧 Config 构造 —— 这是上游的破损组合，不是我们的代码：
+#   error[E0063]: missing field `mtu` in initializer of `webrtc_sctp::association::Config`
+# Cargo 没有「只约束传递依赖」的语法（`[patch.crates-io]` 必须指向 git/local，
+# 会破坏断网部署的「全部来自 crates.io」约束），所以靠 Cargo.lock 把 webrtc-sctp
+# 钉在 0.17.1。CI 全走 `--locked`，不会漂。
+# 万一有人手动 `cargo update` 让它漂回 0.17.2，重新钉一次：
+#   cargo update -p webrtc-sctp --precise 0.17.1
 webrtc = "=0.17.1"
 webrtc-media = "=0.17.1"
 rtp = "=0.17.1"
