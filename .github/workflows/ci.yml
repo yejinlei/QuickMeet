@@ -1,9 +1,9 @@
 # QuickMeet CI（QM-018）
 #
 # 矩阵：
-#   * rust-1.75        —— ubuntu-22.04 + Rust 1.75（MSRV）下
+#   * rust-msrv        —— ubuntu-22.04 + Rust 1.75（MSRV）下
 #                         `cargo build/test --workspace --locked`，跑 scripts/verify.sh 步骤 1-5。
-#   * compose-1.29.2   —— ubuntu-22.04 + docker-compose **1.29.2**（与私有化现场同版本）
+#   * compose-legacy   —— ubuntu-22.04 + docker-compose **1.29.2**（与私有化现场同版本）
 #                         下构建镜像、校验 compose 语法、`up -d --build` + 健康检查。
 #   * windows-webrtc   —— windows-latest + MSVC 下 `cargo test -p qm-media --features webrtc`，
 #                         这是本机（只有 MinGW）跑不到的那一条路。
@@ -41,7 +41,9 @@ env:
 
 jobs:
   # ── Job 1：MSRV 1.75 构建 + 测试 + 端口假设 ────────────────────
-  rust-1.75:
+  # job id 不能用 `.`（rust-1.75 会被 Actions 拒：IDs 只允许字母数字 _ -），
+  # 版本号留在 name 里给人看。
+  rust-msrv:
     name: ubuntu / Rust 1.75 / workspace 全绿
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -85,7 +87,7 @@ jobs:
           if-no-files-found: ignore
 
   # ── Job 2：docker-compose 1.29.2 构建 + 健康检查 ────────────────
-  compose-1.29.2:
+  compose-legacy:
     name: ubuntu / docker-compose 1.29.2 / 容器健康检查
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -173,8 +175,8 @@ jobs:
 
   # ── Job 4：PR 标题格式 ─────────────────────────────────────────
   pr-title:
-    # job name 不能裸放 ` 和 : —— YAML 会把冒号+空格当成 inline mapping 的起始，
-    # 整个 workflow 在解析阶段就失败（2026-09-15 两次 CI 都死在这，日志为空）。
+    # job name 含「冒号+空格」时必须加引号，否则 YAML 当成 inline mapping 报解析错误。
+    # （Actions 的 job id 另有约束：只允许字母数字 _ -，不能带点，见 rust-msrv / compose-legacy）
     name: "PR 标题 QM-00x: xxx 约定"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04

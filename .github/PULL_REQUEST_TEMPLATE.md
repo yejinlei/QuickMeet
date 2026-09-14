@@ -38,8 +38,8 @@ PR 标题约定（强制）：`QM-00x: 简短中文说明`
 补充：哪些步骤因为本机环境缺依赖被 SKIP（例如未装 docker / docker-compose），
 以及 CI 上对应 job 名：
 
-- 本机构建与测试：`rust-1.75`
-- 容器构建与四容器健康检查：`compose-1.29.2`
+- 本机构建与测试：`rust-msrv`
+- 容器构建与四容器健康检查：`compose-legacy`
 - MSVC + webrtc 特性：`windows-webrtc`
 - PR 标题约定：`pr-title`
 
