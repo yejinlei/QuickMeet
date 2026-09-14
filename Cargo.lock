@@ -1847,6 +1847,8 @@ version = "0.1.0"
 dependencies = [
  "async-nats",
  "futures",
+ "http",
+ "hyper",
  "parking_lot",
  "qm-common",
  "serde",

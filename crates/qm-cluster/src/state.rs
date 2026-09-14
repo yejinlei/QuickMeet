@@ -877,7 +877,6 @@ mod tests {
         assert_eq!(reg.owned_count(), 1, "归属节点视角的房间数应不变");
 
         // n1 故障后，这个房间仍要能被迁走（加第二个候选节点）。
-        let mut reg = reg;
         let mut dead = reg.node("n1").unwrap().clone();
         dead.status = NodeStatus::Dead;
         reg.insert_node(dead);

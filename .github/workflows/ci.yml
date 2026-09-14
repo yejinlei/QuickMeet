@@ -1,0 +1,192 @@
+# QuickMeet CI（QM-018）
+#
+# 矩阵：
+#   * rust-1.75        —— ubuntu-22.04 + Rust 1.75（MSRV）下
+#                         `cargo build/test --workspace --locked`，跑 scripts/verify.sh 步骤 1-5。
+#   * compose-1.29.2   —— ubuntu-22.04 + docker-compose **1.29.2**（与私有化现场同版本）
+#                         下构建镜像、校验 compose 语法、`up -d --build` + 健康检查。
+#   * windows-webrtc   —— windows-latest + MSVC 下 `cargo test -p qm-media --features webrtc`，
+#                         这是本机（只有 MinGW）跑不到的那一条路。
+#   * pr-title         —— PR 标题必须符合 `QM-00x: xxx`（各 Issue 正文已要求该格式）。
+#
+# 约束（Issue QM-018 强制约束）：
+#   * 不依赖任何私有凭据：全部工件来自 crates.io / docker hub / GitHub 官方 release。
+#   * 不接入需要公网账户或第三方 SaaS 的监控/构建服务（GitHub Actions 自身除外）。
+#   * compose 语法必须兼容 docker-compose 1.29.2 —— 用真实 1.29.2 二进制校验，
+#     而不是靠 `docker compose config`（那只能验证 2.x 语法）。
+#   * 不硬编码任何密钥；需要密钥时一律走 repository secret，本文件无任何 token 字面量。
+#   * 每个 job 单独 timeout-minutes: 15，满足「单次 CI 运行 ≤15 分钟」。
+#
+# 本地与 CI 跑同一份脚本 `scripts/verify.sh`，避免「本机过、CI 挂」。
+
+name: CI
+
+on:
+  push:
+    branches: [main, 'qm-*']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Job 1：MSRV 1.75 构建 + 测试 + 端口假设 ────────────────────
+  rust-1.75:
+    name: ubuntu / Rust 1.75 / workspace 全绿
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 1.75（MSRV，不用最新版以暴露 MSRV 回归）
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          components: rustfmt, clippy
+          profile: minimal
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          toolchain: "1.75.0"
+
+      # async-nats 依赖 ring，ring 构建需要 pkg-config + C 编译工具。
+      - name: 安装系统依赖（ring / 链接器）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates
+
+      - name: verify 步骤 1-5（MSRV / fmt / clippy / test / qm-demo）
+        run: STEPS="1 2 3 4 5" bash scripts/verify.sh --no-docker
+
+      # clippy 只对本 PR 触碰的 crate 硬挡（见 verify.sh 步骤 2 的注释）；
+      # 其余 crate 的历史 warning 已在 verify 步骤 2c 单独报告，不阻塞合并。
+      - name: clippy 硬挡（本次改动范围）
+        run: cargo clippy --all-targets --locked -p qm-common -p qm-cluster -- -D warnings
+
+      - name: 失败产物
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-1.75-report
+          path: |
+            target/qm-demo.verify.out
+          if-no-files-found: ignore
+
+  # ── Job 2：docker-compose 1.29.2 构建 + 健康检查 ────────────────
+  compose-1.29.2:
+    name: ubuntu / docker-compose 1.29.2 / 容器健康检查
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # CI runner 自带 Docker；补一个与现场一致的 compose 1.29.2。
+      - name: 安装 docker-compose 1.29.2
+        run: |
+          curl -fsSL \
+            https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m) \
+            -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          docker-compose version
+          docker version --format '{{.Server.Version}}'
+
+      - name: 安装 Rust 1.75（Dockerfile 走多阶段：先编译再拷贝）
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          profile: minimal
+
+      - name: 安装系统依赖（ring / 链接器 / curl）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates
+
+      # compose 文件里的 `build:` 会在 CI 上由 docker 构建镜像；
+      # verify 步骤 6 单独验证 Dockerfile 本身能独立构建成功。
+      - name: verify 步骤 6（docker build）
+        run: STEPS=6 bash scripts/verify.sh --no-docker
+
+      - name: verify 步骤 7-9（compose 语法 / up + 健康检查 / 重启自愈）
+        run: STEPS="7 8 9" bash scripts/verify.sh
+
+      - name: 失败产物
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-report
+          path: |
+            target/compose-2x.txt
+          if-no-files-found: ignore
+
+  # ── Job 3：MSVC 工具链 + webrtc feature ────────────────────────
+  windows-webrtc:
+    name: windows-latest / MSVC / qm-media --features webrtc
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 进入 MSVC 开发环境（cl.exe 进 PATH）
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 安装 Rust stable（MSVC 宿主）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          profile: minimal
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 确认 cl.exe 可用（本机只有 MinGW，跑不到这一条）
+        shell: pwsh
+        run: |
+          $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source
+          if (-not $cl) { Write-Error "cl.exe 不可用，webrtc 特性无法编译"; exit 1 }
+          Write-Host "MSVC 编译器: $cl"
+
+      - name: cargo test -p qm-media --features webrtc
+        shell: pwsh
+        run: cargo test -p qm-media --features webrtc --locked
+
+      - name: 失败产物
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msvc-log
+          path: target/**/build/*.log
+          if-no-files-found: ignore
+
+  # ── Job 4：PR 标题格式 ─────────────────────────────────────────
+  pr-title:
+    name: PR 标题 `QM-00x: xxx` 约定
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: 校验 PR 标题
+        shell: bash
+        run: |
+          TITLE="${{ github.event.pull_request.title }}"
+          echo "PR 标题: $TITLE"
+          if echo "$TITLE" | grep -qE '^(QM-[0-9]{3}|YEJ-[0-9]+): .+'; then
+            echo "标题符合 QM-00x: xxx 约定，Issue 自动关联可用"
+          else
+            echo "标题必须以 'QM-00x: ' 或 'YEJ-nn: ' 开头，例如 'QM-006: 集群调度修复'"
+            exit 1
+          fi

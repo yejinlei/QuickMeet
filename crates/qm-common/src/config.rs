@@ -5,7 +5,7 @@
 //   2. `config/local.json`（可选，存在才加载，用于本机/私有化现场覆盖）
 //   3. 环境变量 `QM_XXX_YYY`（覆盖 `xxx.yyy`，现场应急覆盖，无需改文件）
 //
-//// 所有字段都有默认值，加载失败只在"显式指定的文件不存在"时返回 [`ErrorKind::ConfigLoad`]。
+// 所有字段都有默认值，加载失败只在"显式指定的文件不存在"时返回 [`ErrorKind::ConfigLoad`]。
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use crate::error::{Cidr, Error, Result};
 
 /// 应用级全局配置。
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub media: MediaConfig,
@@ -22,19 +22,6 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub ai: AiConfig,
     pub cluster: ClusterConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            media: MediaConfig::default(),
-            network: NetworkConfig::default(),
-            logging: LoggingConfig::default(),
-            storage: StorageConfig::default(),
-            ai: AiConfig::default(),
-            cluster: ClusterConfig::default(),
-        }
-    }
 }
 
 /// 媒体服务配置。
@@ -226,6 +213,12 @@ pub struct ClusterConfig {
     pub listener_capacity: usize,
     /// 单条上行流按多少倍只收流观众折算媒体容量。
     pub listener_fanout: usize,
+    /// 节点健康探针端口（QM-018）。
+    ///
+    /// 集群模式不监听 `media.signaling_port`，docker healthcheck 没有 HTTP 端点可探；
+    /// 节点在这个端口起一个只读 `/healthz`，让 `docker-compose.yml` 的 `healthcheck:`
+    /// 有确定性的目标。默认 8090，刻意避开 8080（媒体）与 8081（信令）。
+    pub health_port: u16,
 }
 
 impl Default for ClusterConfig {
@@ -245,6 +238,7 @@ impl Default for ClusterConfig {
             max_rooms_per_node: 64,
             listener_capacity: 20_000,
             listener_fanout: 200,
+            health_port: 8090,
         }
     }
 }
@@ -439,6 +433,18 @@ impl AppConfig {
         }
         let cidrs = self.network.parsed_cidrs()?;
         self.cluster.validate(&cidrs)?;
+        // 探针端口跨段校验：必须放在这里，因为涉及 media 段，
+        // `ClusterConfig::validate` 拿不到媒体端口。冲突会让 docker healthcheck
+        // 探到错的服务（或探不到），节点被判不健康却实际正常。
+        if self.cluster.health_port != 0
+            && (self.cluster.health_port == self.media.port
+                || self.cluster.health_port == self.media.signaling_port)
+        {
+            return Err(Error::config(format!(
+                "cluster.health_port（{}）不能与 media.port（{}）/ media.signaling_port（{}）相同",
+                self.cluster.health_port, self.media.port, self.media.signaling_port
+            )));
+        }
         Ok(())
     }
 }
@@ -519,6 +525,7 @@ fn known_section(section: &str, field: &str) -> bool {
                     | "max_rooms_per_node"
                     | "listener_capacity"
                     | "listener_fanout"
+                    | "health_port"
             )
     )
 }
@@ -549,7 +556,7 @@ mod tests {
             .any(|c| c.contains(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 192, 168, 0, 55
             )))));
-        assert!(cfg.ai.enabled == false, "AI 能力默认关闭");
+        assert!(!cfg.ai.enabled, "AI 能力默认关闭");
         assert!(cfg.validate().is_ok());
     }
 
@@ -575,6 +582,53 @@ mod tests {
             c.listener_weight()
         );
         assert!(c.is_schedulable());
+    }
+
+    /// 健康探针端口默认 8090，且不撞 8080（媒体）/ 8081（信令）/ 4222（NATS）。
+    #[test]
+    fn cluster_health_port_default_avoids_known_ports() {
+        let c = AppConfig::default().cluster;
+        assert_eq!(c.health_port, 8090);
+        assert_ne!(c.health_port, 8080, "不能占用媒体端口（Epic 全局约束）");
+        assert_ne!(c.health_port, 8081, "不能占用信令端口");
+        assert_ne!(c.health_port, c.port, "不能占用 NATS 端口");
+        assert_ne!(c.health_port, 0, "0 表示禁用探针，不是合理默认值");
+    }
+
+    /// `QM_CLUSTER_HEALTH_PORT` 覆盖探针端口；`QM_*` 白名单拒绝未知字段。
+    #[test]
+    fn env_override_cluster_health_port_and_reject_unknown() {
+        let _g = ENV_LOCK.lock();
+        let dir = "./target/config_health_env";
+        std::fs::create_dir_all(dir).unwrap();
+
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "9090");
+        let (cfg, _) = load_from(dir).expect("cluster.health_port 必须在白名单里");
+        assert_eq!(cfg.cluster.health_port, 9090);
+
+        // 拼错字段名必须 fail fast，不能静默忽略（与 QM_NETWORK_CIDRS_0 同款问题）。
+        std::env::set_var("QM_CLUSTER_HEALTHPRT", "9091");
+        let err = load_from(dir).expect_err("未知字段必须报错");
+        assert!(
+            format!("{err}").contains("healthprt"),
+            "报错信息要带上字段名: {err}"
+        );
+        std::env::remove_var("QM_CLUSTER_HEALTHPRT");
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
+
+        // 跨段校验：探针端口不能和媒体/信令端口撞，否则 healthcheck 会探到错的服务。
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "8080");
+        let clash = load_from(dir).expect_err("health_port 与 media.port 冲突必须报错");
+        assert!(
+            format!("{clash}").contains("cluster.health_port"),
+            "冲突报错要指明字段: {clash}"
+        );
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
+
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "8081");
+        let clash2 = load_from(dir).expect_err("health_port 与 signaling_port 冲突必须报错");
+        assert!(format!("{clash2}").contains("signaling_port"), "{clash2}");
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
     }
 
     #[test]
@@ -638,10 +692,11 @@ mod tests {
         assert!(!src.default_file, "目录内无 default.toml 时不声明该来源");
 
         // QM_ 前缀环境变量优先于默认值（便于多实例并排部署）
-        std::env::set_var("QM_MEDIA_PORT", "8090");
+        // 18080 刻意避开 8090：cluster.health_port 默认 8090，撞了会被跨段校验挡住。
+        std::env::set_var("QM_MEDIA_PORT", "18080");
         let (cfg2, src2) = load_from("./target/config_empty").unwrap();
         std::env::remove_var("QM_MEDIA_PORT");
-        assert_eq!(cfg2.media.port, 8090, "QM_MEDIA_PORT 必须覆盖默认端口");
+        assert_eq!(cfg2.media.port, 18080, "QM_MEDIA_PORT 必须覆盖默认端口");
         assert!(src2.env_overrides > 0, "有环境变量时必须声明 env 来源");
     }
 
@@ -700,7 +755,7 @@ mod tests {
 
         // 未设置的环境变量必须保持默认值，不能被上面的键污染。
         assert_eq!(cfg.media.max_participants, 64);
-        assert_eq!(cfg.storage.encrypted, false);
+        assert!(!cfg.storage.encrypted);
     }
 
     #[test]
@@ -734,8 +789,7 @@ mod tests {
             port = 8085
             [network]
             cidrs = ["192.168.0.0/24", "10.0.0.0/8"]
-            "#
-            .into(),
+            "#,
         ))
         .join(figment::providers::Serialized::defaults(
             AppConfig::default(),

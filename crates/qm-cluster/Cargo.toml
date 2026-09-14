@@ -24,6 +24,12 @@ async-nats = { version = "=0.37.0", default-features = false, features = ["ring"
 tokio = { workspace = true }
 futures = { workspace = true }
 
+# 健康探针（QM-018）：集群模式不监听 8081，docker healthcheck 没有 HTTP 端点可探。
+# 固定 0.14.28 —— 与 workspace 里 `qm-signaling` 的 hyper 同版本，锁文件里只保留
+# 一份 hyper（0.15 是另一个不兼容版本，会和 signaling 的 Body 类型冲突）。
+hyper = { version = "=0.14.28", features = ["server", "http1", "tcp"] }
+http = "=0.2.12"
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 

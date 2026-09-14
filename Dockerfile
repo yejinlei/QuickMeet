@@ -6,9 +6,10 @@
 FROM rust:1.75-slim
 
 # slim 镜像不带 gcc，而 Cargo 构建 proc-macro / 少量 -sys crate 时需要一个 C 链接器。
-# 这里只做最小安装，不在镜像里装 MSVC / Visual Studio Build Tools。
+# curl / wget 是 docker-compose.yml 里 healthcheck 的命令（1.29.2 用 POST 探活），
+# 只加这两个，不装 MSVC / Visual Studio Build Tools。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends build-essential curl wget \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

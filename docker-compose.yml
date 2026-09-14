@@ -55,6 +55,11 @@ services:
 
   # 媒体/编解码层：跑 VP8 / H.264 / Opus 收发兼容验证，并可起信令服务。
   # 同时是本机第一个集群节点（node-1）。
+  #
+  # 健康探针（QM-018）：集群模式不监听 8081，没有 HTTP 端点可做探针，
+  # 所以节点另起一个只读 /healthz（容器内固定 8090，宿主机暴露 8091）。
+  # interval 5s × retries 2 = 10s，与配置里的「判死窗口」heartbeat 5s ×
+  # misses 2 = 10s 对齐 —— 容器判死和集群判死用同一个口径。
   qm-media:
     build:
       context: .
@@ -71,22 +76,26 @@ services:
     # 媒体服务默认监听 8080（Epic 全局约束）。
     ports:
       - "8080:8080"
-      - "8081:8081"
+      - "8091:8090"   # 集群健康探针（CI / 运维探活入口）
     # 只绑内网网段：容器网络固定映射到 192.168.0.0/24 的主机侧地址。
     env_file:
       - config/container.env
     # 节点身份：每个集群节点必须覆盖 node_id 与 advertised_addr。
+    # 探针端口由 container.env 的 QM_CLUSTER_HEALTH_PORT=8090 统一控制。
     environment:
       - QM_CLUSTER_NODE_ID=node-1
       - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.10:8080
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8090/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 2
+      start_period: 30s
     volumes:
       - meeting-data:/opt/quickmeet/data
       - meeting-logs:/opt/quickmeet/logs
     networks:
       - quickmeet
-    # 1.29.2 支持 healthcheck，但集群模式下本容器不监听 8081，
-    # 没有可用的 HTTP 探针；
-    # 存活由 restart: unless-stopped + qm-nats 的 healthcheck 保证。
     logging:
       driver: "json-file"
       options:
@@ -109,19 +118,23 @@ services:
       - qm-nats
     ports:
       - "8082:8080"
-      - "18081:8081"
+      - "8092:8090"   # 集群健康探针
     env_file:
       - config/container.env
     environment:
       - QM_CLUSTER_NODE_ID=node-2
       - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.11:8082
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8090/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 2
+      start_period: 30s
     volumes:
       - meeting-data-2:/opt/quickmeet/data
       - meeting-logs:/opt/quickmeet/logs
     networks:
       - quickmeet
-    # 集群模式下 8081 没有监听端口，不能做 HTTP 探针；
-    # 存活由 restart: unless-stopped + qm-nats 的 healthcheck 保证。
     logging:
       driver: "json-file"
       options:
@@ -144,19 +157,23 @@ services:
       - qm-nats
     ports:
       - "8083:8080"
-      - "18082:8081"
+      - "8093:8090"   # 集群健康探针
     env_file:
       - config/container.env
     environment:
       - QM_CLUSTER_NODE_ID=node-3
       - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.12:8083
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8090/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 2
+      start_period: 30s
     volumes:
       - meeting-data-3:/opt/quickmeet/data
       - meeting-logs:/opt/quickmeet/logs
     networks:
       - quickmeet
-    # 集群模式下 8081 没有监听端口，不能做 HTTP 探针；
-    # 存活由 restart: unless-stopped + qm-nats 的 healthcheck 保证。
     logging:
       driver: "json-file"
       options:
@@ -185,6 +202,12 @@ services:
       - --bind
       - 0.0.0.0
       - --signal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 2
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
