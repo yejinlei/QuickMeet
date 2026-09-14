@@ -173,7 +173,9 @@ jobs:
 
   # ── Job 4：PR 标题格式 ─────────────────────────────────────────
   pr-title:
-    name: PR 标题 `QM-00x: xxx` 约定
+    # job name 不能裸放 ` 和 : —— YAML 会当成 inline mapping 解析失败，
+    # 整条 workflow 直接不跑（2026-09-15 两次 CI 都是死在这，run 日志为空）。
+    name: "PR 标题 QM-00x: xxx 约定"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
     timeout-minutes: 5
