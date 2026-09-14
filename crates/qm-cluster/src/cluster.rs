@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use qm_common::{ClusterConfig, NodeRole, Result as QmResult};
 
-use crate::bus::{MigrationResult, NatsBus, RoomRouteRequest};
+use crate::bus::{MigrationResult, NatsBus, RoomRouteRequest, SnapshotPayload};
 use crate::state::{
     unix_ms, HeartbeatMsg, MigrationRequest, Node, NodeRoleTag, NodeStatus, Registry, RoomState,
     Router, DEFAULT_NEW_ROOM_STREAMS,
@@ -159,11 +159,17 @@ impl Cluster {
         // 不必等远端心跳来回确认。
         self.register_self();
         let bus = Arc::new(bus);
-        self.broadcast_snapshot(&bus).await.ok();
+        // 加入集群时立刻发一次自己归属的房间，让其它节点马上看到本节点；
+        // 之后由 snapshot_publish_loop 每个心跳周期重发（新节点靠它追上全量状态）。
+        {
+            let (rooms, total) = self.owned_rooms_and_total();
+            let _ = bus.publish_snapshot(&rooms, total).await;
+        }
 
         // 每个后台循环各持一份 bus 克隆：`async move` 会捕获按值移动的 `Arc`，
         // 所以先把每份克隆绑定成局部变量再 spawn。
-        let (bus_hb, bus_hb_recv, bus_route, bus_mig, bus_snap) = (
+        let (bus_hb, bus_hb_recv, bus_route, bus_mig, bus_snap_pub, bus_snap_sub) = (
+            Arc::clone(&bus),
             Arc::clone(&bus),
             Arc::clone(&bus),
             Arc::clone(&bus),
@@ -197,9 +203,14 @@ impl Cluster {
             mig.migrate_loop(bus_mig).await;
         });
 
-        let snap = Arc::clone(&self);
+        let snap_pub = Arc::clone(&self);
         tokio::spawn(async move {
-            snap.snapshot_loop(bus_snap).await;
+            snap_pub.snapshot_publish_loop(bus_snap_pub).await;
+        });
+
+        let snap_sub = Arc::clone(&self);
+        tokio::spawn(async move {
+            snap_sub.snapshot_loop(bus_snap_sub).await;
         });
 
         let rooms_sub = Arc::clone(&self);
@@ -288,7 +299,7 @@ impl Cluster {
     pub fn assign_room(&self, room_id: &str) -> Option<String> {
         let reg = self.registry.lock();
         self.router
-            .assign(&reg, &self.cfg, room_id, DEFAULT_NEW_ROOM_STREAMS, 0)
+            .assign(&reg, room_id, DEFAULT_NEW_ROOM_STREAMS, 0)
     }
 
     // ── 房间管理 ──
@@ -298,16 +309,35 @@ impl Cluster {
         self.rooms.lock().values().cloned().collect()
     }
 
-    /// 广播本节点归属的房间快照。
-    pub async fn broadcast_snapshot(&self, bus: &NatsBus) -> QmResult<()> {
-        let rooms: Vec<RoomState> = self
-            .registry
-            .lock()
+    /// 快照发送循环：`initialize` 时先发一次，之后每 `heartbeat_secs` 重发一次。
+    ///
+    /// 周期重发（而不是只在启动时发一次）是为了让**新节点上线就能拿到快照**：
+    /// 它连上 NATS 之后订阅 `room.snapshot`，下一个心跳周期就会收到各节点发来的
+    /// 自己归属的房间 —— 这是「新节点 30 秒内接入并承接新会议」的实现路径，
+    /// 不依赖请求/回复那种要求对端先在线的交互。
+    ///
+    /// `total` 是**本节点房间视图的总数**，而不是 `rooms` 的长度：`rooms` 只含
+    /// 本节点归属的房间，`total` 是本节点看到的全集群房间数。`snapshot_loop` 拿
+    /// 它判断一份快照是否覆盖了整个集群，从而避免用部分快照冲掉自己已有的视图。
+    async fn snapshot_publish_loop(self: Arc<Self>, bus: Arc<NatsBus>) {
+        let interval = Duration::from_secs(self.cfg.heartbeat_secs.max(1));
+        loop {
+            let (rooms, total) = self.owned_rooms_and_total();
+            let _ = bus.publish_snapshot(&rooms, total).await;
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// 本节点归属的房间 + 本节点房间视图总数（在同一个锁作用域内取，避免中间态）。
+    fn owned_rooms_and_total(&self) -> (Vec<RoomState>, usize) {
+        let reg = self.registry.lock();
+        let total = reg.rooms().count();
+        let rooms = reg
             .rooms()
             .filter(|r| r.owner.as_deref() == Some(self.cfg.node_id.as_str()))
             .cloned()
             .collect();
-        bus.publish_snapshot(&rooms).await
+        (rooms, total)
     }
 
     /// 收到一条远端房间状态更新。
@@ -318,11 +348,17 @@ impl Cluster {
         }
     }
 
-    /// 收到一次房间快照（新节点上线时用）。
-    pub fn apply_remote_snapshot(&self, rooms: Vec<RoomState>) {
-        let total_rooms = rooms.len();
+    /// 收到一次房间快照（各节点的 `snapshot_publish_loop` 周期发布）。
+    ///
+    /// `payload.rooms` 只含发送方自己归属的房间，所以**逐房间按 `revision` 收敛**
+    /// 就够了 —— 快照是追加式的，不需要按 `total` 反推删除：房间结束走的是
+    /// `room.update` / `room.remove`，不是「不再出现在快照里」。`total` 只是
+    /// 发送方看到的全集群房间数，用于判断这份快照是否覆盖了整个集群（日志与
+    /// 后续的对账），不用于删除本节点已有的房间。
+    pub fn apply_remote_snapshot(&self, payload: SnapshotPayload) {
+        let total_rooms = payload.total;
         let mut local_changes = 0usize;
-        for room in rooms {
+        for room in payload.rooms {
             self.registry.lock().apply_room(room.clone());
             if room.owner.as_deref() == Some(self.cfg.node_id.as_str()) {
                 self.rooms.lock().insert(room.id.clone(), room);
@@ -446,6 +482,8 @@ impl Cluster {
             last_seq: self.hb_seq.fetch_add(1, Ordering::SeqCst) + 1,
             status: NodeStatus::Live,
             max_rooms: self.cfg.max_rooms_per_node as u64,
+            listener_capacity: self.cfg.listener_capacity as u64,
+            listener_fanout: self.cfg.listener_fanout as u64,
             dead_since_ms: None,
         };
         let _ = self.registry.lock().insert_node(node);
@@ -454,7 +492,7 @@ impl Cluster {
     fn migration_destination(&self, exclude: &str, streams: u64, listeners: u64) -> Option<String> {
         let reg = self.registry.lock();
         self.router
-            .migration_destination(&reg, &self.cfg, Some(exclude), streams, listeners)
+            .migration_destination(&reg, Some(exclude), streams, listeners)
     }
 
     fn bump_status<F: FnOnce(&mut ClusterStatus)>(&self, f: F) {
@@ -616,7 +654,7 @@ impl Cluster {
             let decision = {
                 let reg = self.registry.lock();
                 self.router
-                    .assign(&reg, &self.cfg, &req.room_id, req.streams, req.listeners)
+                    .assign(&reg, &req.room_id, req.streams, req.listeners)
             };
             // 队列订阅只会被队列里的一个节点消费，所以回包不会重复。
             // 无可用目标时回一个空串，请求方据此区分「调度失败」与「超时」。
@@ -638,7 +676,8 @@ impl Cluster {
 
     /// 队列订阅迁移请求：目标节点处理并回包。
     async fn migrate_loop(self: Arc<Self>, bus: Arc<NatsBus>) {
-        // 只订阅「投给本节点」的迁移请求；队列名按 node_id 分片，避免与路由队列串台。
+        // 只订阅「投给本节点」的迁移请求：subject 本身按目标 node_id 分片，
+        // 所以这里不靠队列分摊，用队列名只为与路由队列区分。
         let subject = bus.subjects().migrate_for_self.clone();
         let Some(mut sub) = bus.queue_subscribe(&subject, "migrate").await.ok() else {
             warn!("无法订阅迁移 subject，故障迁移将不会发生");
@@ -653,7 +692,7 @@ impl Cluster {
         }
     }
 
-    /// 订阅房间全量快照。
+    /// 订阅房间全量快照（发送方是各节点的 `snapshot_publish_loop`）。
     async fn snapshot_loop(self: Arc<Self>, bus: Arc<NatsBus>) {
         let subject = bus.subjects().room_snapshot.clone();
         let Some(mut sub) = bus.subscribe(&subject).await.ok() else {
@@ -661,9 +700,11 @@ impl Cluster {
             return;
         };
         while let Some(msg) = sub.next().await {
-            if let Some(rooms) = decode::<Vec<RoomState>>(&msg.payload) {
-                self.apply_remote_snapshot(rooms);
-            }
+            let Some(payload) = decode::<SnapshotPayload>(&msg.payload) else {
+                warn!("收到无法解析的房间快照，已忽略");
+                continue;
+            };
+            self.apply_remote_snapshot(payload);
         }
     }
 
@@ -707,8 +748,7 @@ impl Cluster {
 
         let can_accept = {
             let reg = self.registry.lock();
-            self.router
-                .can_accept(&reg, &self.cfg, req.streams, req.listeners)
+            self.router.can_accept(&reg, req.streams, req.listeners)
         };
         if !can_accept {
             self.publish_reject(bus, msg.clone(), req, "本节点无承接余量")
@@ -776,7 +816,7 @@ mod tests {
     use super::*;
     use qm_common::ClusterConfig;
 
-    fn cfg(node: &str) -> ClusterConfig {
+    fn tcfg(node: &str) -> ClusterConfig {
         ClusterConfig {
             node_id: node.to_string(),
             advertised_addr: "192.168.0.10:8080".to_string(),
@@ -794,13 +834,13 @@ mod tests {
 
     #[test]
     fn assign_returns_none_when_no_candidates() {
-        let cluster = Cluster::new(cfg("n1"));
+        let cluster = Cluster::new(tcfg("n1"));
         assert!(cluster.assign_room("room-1").is_none());
     }
 
     #[test]
     fn apply_remote_room_updates_registry_only_when_owned() {
-        let cluster = Cluster::new(cfg("n1"));
+        let cluster = Cluster::new(tcfg("n1"));
         // 不属于自己的房间：只进 registry 视图，不进本地 rooms map。
         let room = RoomState::new("r1", 1, 3).with_owner(
             Some("n2".to_string()),
@@ -814,7 +854,7 @@ mod tests {
 
     #[test]
     fn apply_remote_room_inserts_owned_room() {
-        let cluster = Cluster::new(cfg("n1"));
+        let cluster = Cluster::new(tcfg("n1"));
         let room = RoomState::new("r1", 1, 3).with_owner(
             Some("n1".to_string()),
             "192.168.0.10:8080",
@@ -827,7 +867,7 @@ mod tests {
 
     #[test]
     fn status_snapshot_defaults() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         let s = c.status_snapshot();
         assert_eq!(s.node_id, "n1");
         assert_eq!(s.cluster_id, "quickmeet");
@@ -838,7 +878,7 @@ mod tests {
 
     #[test]
     fn register_self_makes_node_schedulable() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         c.register_self();
         // 自身节点健康，因此可以作为调度目标
         assert!(c.is_node_healthy("n1"));
@@ -847,7 +887,7 @@ mod tests {
 
     #[test]
     fn total_listeners_aggregates_registry() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         c.apply_remote_room(RoomState::new("r1", 1, 10));
         c.apply_remote_room(RoomState::new("r2", 1, 20));
         assert_eq!(c.total_listeners(), 30);
@@ -856,7 +896,7 @@ mod tests {
 
     #[test]
     fn migration_destination_excludes_dead_node() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         c.register_self();
         // 只有一个候选（自身），排除后没有目标
         let dest = c.migration_destination("n1", 1, 0);
@@ -865,8 +905,53 @@ mod tests {
 
     #[tokio::test]
     async fn remove_room_returns_false_when_absent() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         // 无 NATS bus 时只验证本地行为：房间不存在时不改任何状态。
         assert!(c.rooms_snapshot().is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_merges_owned_and_foreign_rooms() {
+        // `rooms` 只含发送方归属的房间，`total` 是发送方看到的全集群房间数 ——
+        // 两者含义不同，所以本地房间数应由 rooms 决定，不能拿 total 去删已有房间。
+        let c = Cluster::new(tcfg("n1"));
+        let foreign = RoomState::new("r-f", 1, 5).with_owner(
+            Some("n2".to_string()),
+            "192.168.0.11:8080",
+            NodeRole::Full,
+        );
+        let own = RoomState::new("r-o", 1, 2).with_owner(
+            Some("n1".to_string()),
+            "192.168.0.10:8080",
+            NodeRole::Full,
+        );
+        c.apply_remote_snapshot(SnapshotPayload {
+            total: 5,
+            rooms: vec![foreign, own],
+        });
+        assert_eq!(c.room_count(), 2, "视图里应有两个房间");
+        assert_eq!(c.rooms_snapshot().len(), 1, "只有本节点归属的进本地 map");
+        assert_eq!(c.rooms_snapshot()[0].id, "r-o");
+        assert!(c.registry.lock().room("r-f").is_some());
+        assert_eq!(c.total_listeners(), 7);
+    }
+
+    #[test]
+    fn listener_count_update_keeps_ownership() {
+        // add_listener / remove_listener 走的是 `with_counts`：只改计数，
+        // owner 必须保持，否则整个集群会把房间当成未归属的 pending 房间，
+        // Router::assign 跳过它、故障迁移也找不到它。
+        let c = Cluster::new(tcfg("n1"));
+        let room = RoomState::new("r1", 1, 3).with_owner(
+            Some("n2".to_string()),
+            "192.168.0.11:8080",
+            NodeRole::Full,
+        );
+        c.apply_remote_room(room.clone());
+        c.apply_remote_room(room.with_counts(1, 4));
+        let reg = c.registry.lock();
+        let cur = reg.room("r1").expect("房间仍在");
+        assert_eq!(cur.owner.as_deref(), Some("n2"), "加旁听后归属不能丢");
+        assert!(cur.is_owned());
     }
 }

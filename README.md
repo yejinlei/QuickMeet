@@ -10,7 +10,7 @@
 ```bash
 cargo build --release
 ./target/release/qm-demo                      # 编解码收发兼容验证报告
-cargo test --workspace                         # 166 个回归测试
+cargo test --workspace                         # 182 个回归测试
 QM_NETWORK_BIND_HOST=127.0.0.1 \
   ./target/release/qm-demo --signal --bind 127.0.0.1   # 起信令服务
 ./target/release/qm-demo --cluster                     # 集群模式（QM-006，需 NATS）

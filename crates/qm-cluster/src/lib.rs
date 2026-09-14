@@ -14,9 +14,12 @@
 //!
 //! ## 关键设计
 //!
-//! * **节点动态增减无需重启**：成员关系由心跳维护（`qm.<cid>.hb.*`），
-//!   房间视图由订阅 + 全量快照维护。新节点上线时先订阅、再拉快照，
-//!   随后开始承接新会议。
+//! * **节点动态增减无需重启**：成员关系由心跳维护（`qm.<cid>.hb.*`）。
+//!   房间视图由订阅维护，每个节点每 `heartbeat_secs` 广播一次自己归属的
+//!   房间快照（`SnapshotPayload`），所以**晚到的节点**在一个心跳周期内就能
+//!   追上全量状态 —— 不依赖请求/回复那种要求对端先在线的交互。
+//!   快照携带发送方的 `total`（它看到的全集群房间数），接收方据此判断
+//!   这份快照是否覆盖了整个集群；`rooms` 只含发送方归属的房间。
 //! * **故障自动下线**：连续错过 `unhealthy_misses` 次心跳即判死，
 //!   触发其归属房间的迁移。`failover_target_secs` 是目标时限（默认 10s）。
 //! * **最低负载调度**：按「会议数占比 + 旁听人数占比」两个维度归一后相加，
@@ -39,7 +42,7 @@ pub mod cluster;
 pub mod server;
 pub mod state;
 
-pub use bus::{MigrationResult, NatsBus, RoomRouteRequest, Subjects};
+pub use bus::{MigrationResult, NatsBus, RoomRouteRequest, SnapshotPayload, Subjects};
 pub use cluster::{Cluster, ClusterStatus, MigrationRecord};
 pub use server::run_cluster;
 pub use state::{
