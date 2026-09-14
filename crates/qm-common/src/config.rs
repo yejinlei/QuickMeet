@@ -218,6 +218,7 @@ pub struct ClusterConfig {
     /// 集群模式不监听 `media.signaling_port`，docker healthcheck 没有 HTTP 端点可探；
     /// 节点在这个端口起一个只读 `/healthz`，让 `docker-compose.yml` 的 `healthcheck:`
     /// 有确定性的目标。默认 8090，刻意避开 8080（媒体）与 8081（信令）。
+    /// 必须是 1..=65535 之间的非冲突值：写 0 等于探针没有目标，容器永远 unhealthy。
     pub health_port: u16,
 }
 
@@ -433,12 +434,18 @@ impl AppConfig {
         }
         let cidrs = self.network.parsed_cidrs()?;
         self.cluster.validate(&cidrs)?;
-        // 探针端口跨段校验：必须放在这里，因为涉及 media 段，
+        // 探针端口校验：写 0 等于禁用探针，会让 compose healthcheck 没有目标可探
+        // （容器永远 unhealthy），所以配置层直接挡住，不把 0 当合法值传下去。
+        if self.cluster.health_port == 0 {
+            return Err(Error::config(
+                "cluster.health_port 不能为 0（写 0 会禁用探针，让 docker healthcheck 无端点可探）",
+            ));
+        }
+        // 跨段校验：必须放在这里，因为涉及 media 段，
         // `ClusterConfig::validate` 拿不到媒体端口。冲突会让 docker healthcheck
         // 探到错的服务（或探不到），节点被判不健康却实际正常。
-        if self.cluster.health_port != 0
-            && (self.cluster.health_port == self.media.port
-                || self.cluster.health_port == self.media.signaling_port)
+        if self.cluster.health_port == self.media.port
+            || self.cluster.health_port == self.media.signaling_port
         {
             return Err(Error::config(format!(
                 "cluster.health_port（{}）不能与 media.port（{}）/ media.signaling_port（{}）相同",
@@ -628,6 +635,15 @@ mod tests {
         std::env::set_var("QM_CLUSTER_HEALTH_PORT", "8081");
         let clash2 = load_from(dir).expect_err("health_port 与 signaling_port 冲突必须报错");
         assert!(format!("{clash2}").contains("signaling_port"), "{clash2}");
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
+
+        // 写 0 必须报错：探针没有目标会让容器永远 unhealthy。
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "0");
+        let zero = load_from(dir).expect_err("health_port = 0 必须报错");
+        assert!(
+            format!("{zero}").contains("不能为 0"),
+            "写 0 的报错要说明原因: {zero}"
+        );
         std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
     }
 

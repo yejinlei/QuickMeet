@@ -86,14 +86,13 @@ pub fn run_cluster(config_dir: &str) -> QmResult<()> {
 }
 
 /// 从配置推导探针监听地址：端口取 `cluster.health_port`（`QM_CLUSTER_HEALTH_PORT`
-/// 可覆盖），绑 `network.bind_host`；端口为 0 时回退默认 8090，避免 bind 到随机端口
-/// 让 compose 探针失去目标。
+/// 可覆盖），绑 `network.bind_host`。
+///
+/// 端口为 0 不在这里兜底：`AppConfig::validate` 已经保证 `health_port != 0`，
+/// 如果这里再写一个回退默认值，就出现两套「禁用探针」的语义（文档说「0 表示禁用」，
+/// 代码实际绑 8090）。让配置层单一负责，`health_addr` 只做地址拼接。
 pub fn health_addr(cfg: &qm_common::AppConfig) -> SocketAddr {
-    let port = if cfg.cluster.health_port == 0 {
-        DEFAULT_HEALTH_PORT
-    } else {
-        cfg.cluster.health_port
-    };
+    let port = cfg.cluster.health_port;
     let s = format!("{}:{}", cfg.network.bind_host, port);
     SocketAddr::from_str(&s).unwrap_or_else(|_| {
         SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -290,15 +289,12 @@ mod tests {
         assert_eq!(addr.ip().to_string(), "192.168.0.10");
     }
 
-    /// `QM_CLUSTER_HEALTH_PORT` 覆盖端口；端口 0 回退默认。
+    /// `QM_CLUSTER_HEALTH_PORT` 覆盖端口（0 不在这里兜底，由配置层校验挡住）。
     #[test]
     fn health_addr_honors_config_override() {
         let mut cfg = AppConfig::default();
         cfg.cluster.health_port = 9090;
         assert_eq!(health_addr(&cfg).port(), 9090);
-
-        cfg.cluster.health_port = 0;
-        assert_eq!(health_addr(&cfg).port(), DEFAULT_HEALTH_PORT);
     }
 
     /// GET /healthz → 200 + JSON，且带 nats_connected / version 字段。
