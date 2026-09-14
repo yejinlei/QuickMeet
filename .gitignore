@@ -22,3 +22,6 @@ Thumbs.db
 # Multica / 工具本地状态
 .claude/
 .multica/
+
+target-gnu/
+target/qm003/

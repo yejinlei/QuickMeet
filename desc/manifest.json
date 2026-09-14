@@ -1,0 +1,138 @@
+[
+ {
+  "no": "QM-001",
+  "title": "基础 Rust 异步框架搭建与 webrtc-rs 编解码验证",
+  "stage": 1,
+  "agent": "代码高手 Claude（高阶攻坚专属）",
+  "agent_id": "1ef2db42-c45f-48f5-b061-c3c84140b467",
+  "file": "desc/qm-001.md"
+ },
+ {
+  "no": "QM-002",
+  "title": "SFU 选择性转发架构与音视频轨道解耦管理",
+  "stage": 1,
+  "agent": "代码高手Codex-02",
+  "agent_id": "f68c8312-25a7-4954-b387-c061da0363c8",
+  "file": "desc/qm-002.md"
+ },
+ {
+  "no": "QM-003",
+  "title": "NACK/FEC 弱网优化与硬件加速（单服 200+ 路承载）",
+  "stage": 1,
+  "agent": "代码高手Codex-03",
+  "agent_id": "f480ef83-4c8a-4a85-b94a-0ce8597cb24a",
+  "file": "desc/qm-003.md"
+ },
+ {
+  "no": "QM-004",
+  "title": "WebSocket 信令协议、SDP/ICE 协商与 JWT 鉴权",
+  "stage": 2,
+  "agent": "代码高手Codex-02",
+  "agent_id": "f68c8312-25a7-4954-b387-c061da0363c8",
+  "file": "desc/qm-004.md"
+ },
+ {
+  "no": "QM-005",
+  "title": "房间生命周期管理与参会者权限、主持人控制",
+  "stage": 2,
+  "agent": "代码高手Codex-03",
+  "agent_id": "f480ef83-4c8a-4a85-b94a-0ce8597cb24a",
+  "file": "desc/qm-005.md"
+ },
+ {
+  "no": "QM-006",
+  "title": "NATS 分布式状态同步与集群路由调度（万人级旁听扩容）",
+  "stage": 2,
+  "agent": "代码高手 Claude（高阶攻坚专属）",
+  "agent_id": "1ef2db42-c45f-48f5-b061-c3c84140b467",
+  "file": "desc/qm-006.md"
+ },
+ {
+  "no": "QM-007",
+  "title": "对接硅基流动 ASR 实现实时语音转写与字幕推送",
+  "stage": 3,
+  "agent": "代码高手Codex-01",
+  "agent_id": "4fa7b7fa-8d24-4e54-ab1a-da2030eb9093",
+  "file": "desc/qm-007.md"
+ },
+ {
+  "no": "QM-008",
+  "title": "大模型驱动的智能会议纪要自动生成",
+  "stage": 3,
+  "agent": "代码高手Codex-03",
+  "agent_id": "f480ef83-4c8a-4a85-b94a-0ce8597cb24a",
+  "file": "desc/qm-008.md"
+ },
+ {
+  "no": "QM-009",
+  "title": "AI 音视频增强：虚拟背景与智能降噪",
+  "stage": 3,
+  "agent": "代码高手 Claude（高阶攻坚专属）",
+  "agent_id": "1ef2db42-c45f-48f5-b061-c3c84140b467",
+  "file": "desc/qm-009.md"
+ },
+ {
+  "no": "QM-010",
+  "title": "AI 弱网自适应码率",
+  "stage": 3,
+  "agent": "代码高手Codex-02",
+  "agent_id": "f68c8312-25a7-4954-b387-c061da0363c8",
+  "file": "desc/qm-010.md"
+ },
+ {
+  "no": "QM-011",
+  "title": "React 网页客户端（多布局、屏幕共享、字幕）",
+  "stage": 4,
+  "agent": "代码高手Codex-01",
+  "agent_id": "4fa7b7fa-8d24-4e54-ab1a-da2030eb9093",
+  "file": "desc/qm-011.md"
+ },
+ {
+  "no": "QM-012",
+  "title": "Tauri 桌面客户端（系统级共享、本地录制）",
+  "stage": 4,
+  "agent": "代码高手Codex-03",
+  "agent_id": "f480ef83-4c8a-4a85-b94a-0ce8597cb24a",
+  "file": "desc/qm-012.md"
+ },
+ {
+  "no": "QM-013",
+  "title": "Flutter + Rust FFI 移动客户端（移动网络与低功耗）",
+  "stage": 4,
+  "agent": "代码高手Codex-02",
+  "agent_id": "f68c8312-25a7-4954-b387-c061da0363c8",
+  "file": "desc/qm-013.md"
+ },
+ {
+  "no": "QM-014",
+  "title": "三端全量联调与性能验收测试",
+  "stage": 4,
+  "agent": "资深测试工程师",
+  "agent_id": "c604557f-3d56-4baa-9ec5-2d8a6bfe834a",
+  "file": "desc/qm-014.md"
+ },
+ {
+  "no": "QM-015",
+  "title": "DTLS-SRTP 全链路加密与安全合规（审计、水印）",
+  "stage": 5,
+  "agent": "代码高手 Claude（高阶攻坚专属）",
+  "agent_id": "1ef2db42-c45f-48f5-b061-c3c84140b467",
+  "file": "desc/qm-015.md"
+ },
+ {
+  "no": "QM-016",
+  "title": "Docker 编排一键私有化部署（兼容 docker-compose 1.29.2）",
+  "stage": 5,
+  "agent": "代码高手Codex-01",
+  "agent_id": "4fa7b7fa-8d24-4e54-ab1a-da2030eb9093",
+  "file": "desc/qm-016.md"
+ },
+ {
+  "no": "QM-017",
+  "title": "可视化监控面板、异常告警与单命令运维脚本",
+  "stage": 5,
+  "agent": "代码高手Codex-01",
+  "agent_id": "4fa7b7fa-8d24-4e54-ab1a-da2030eb9093",
+  "file": "desc/qm-017.md"
+ }
+]

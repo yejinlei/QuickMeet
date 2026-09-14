@@ -1,0 +1,23 @@
+[package]
+name = "qm-sfu"
+description = "QuickMeet SFU 层：选择性转发架构 + 音视频轨道解耦管理 + STUN/TURN 穿透"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+qm-common = { path = "../qm-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[features]
+default = []

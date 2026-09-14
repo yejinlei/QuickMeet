@@ -1,4 +1,4 @@
-# QuickMeet workspace — Stage 1 baseline (YEJ-90)
+# QuickMeet workspace — Stage 1 baseline (YEJ-90) + SFU (YEJ-91)
 #
 # 约束（继承 Epic YEJ-89 全局强制约束）：
 #   * MSRV 1.75：仅使用 crates.io 公共 crate，配合 Cargo 的
@@ -12,6 +12,7 @@ members = [
     "crates/qm-common",
     "crates/qm-media",
     "crates/qm-signaling",
+    "crates/qm-sfu",
     "demos/qm-demo",
 ]
 
