@@ -1,0 +1,13 @@
+name: Probe2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  b:
+    name: has on and jobs and timeout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: t
+        run: echo b

@@ -1,0 +1,12 @@
+name: Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  a:
+    name: has on and jobs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: t
+        run: echo a
