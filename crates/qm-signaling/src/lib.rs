@@ -30,10 +30,11 @@ use std::time::Duration;
 use http::{Method, Request, Response, StatusCode};
 use hyper::service::Service;
 use parking_lot::Mutex;
+use qm_cluster::Cluster;
 use qm_common::error::Error;
 use qm_common::error::Result as QmResult;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// 信令服务默认端口（媒体端口 8080，信令错开一位）。
 pub const DEFAULT_SIGNALING_PORT: u16 = 8081;
@@ -51,6 +52,9 @@ pub struct Peer {
 #[derive(Debug, Default)]
 struct Room {
     peers: Vec<Peer>,
+    /// 本房间的集群归属节点 id（`POST /place` 的落点）。
+    /// `None` 表示信令侧自建、集群不可用，客户端应退化到单机模式。
+    owner: Option<String>,
 }
 
 /// 信令内存状态。
@@ -61,6 +65,10 @@ struct State {
     sdp_exchanges: u64,
     /// 已转发 ICE candidate 总数。
     candidates_exchanged: u64,
+    /// 已受理的建会议请求数（`POST /place`）。
+    rooms_placed: u64,
+    /// 因集群不可用而降级（409）的建会议请求数。
+    rooms_placement_failed: u64,
 }
 
 /// 信令路由：状态 + 配置 + 纯函数分发（状态在 `Arc` 里，可自由克隆）。
@@ -68,14 +76,36 @@ struct State {
 pub struct SignalRouter {
     cfg: Arc<qm_common::AppConfig>,
     state: Arc<Mutex<State>>,
+    /// 集群句柄（QM-024 F3）。
+    ///
+    /// `Some` 时 `POST /room/{id}/place` 才会真正把会议建成 —— 信令进程
+    /// 必须自己连上 NATS 并加入集群，会议落点才算有集群可观测的归属；
+    /// `None` 时该端点返回 `503`，不会静默降级成「信令本地建了个空房间」。
+    cluster: Option<Arc<Cluster>>,
+    /// 落点请求的等待上限。`cluster.request_create_room` 内部要等 NATS 句柄
+    /// 就绪（信令进程刚起、NATS 还没起来时），这个上限保证信令线程不会被拖住。
+    place_timeout: Duration,
 }
 
 impl SignalRouter {
-    /// 按配置构造路由器。
+    /// 按配置构造路由器（不接入集群，落点端点会返回 503）。
     pub fn new(cfg: Arc<qm_common::AppConfig>) -> Self {
+        Self::with_cluster(cfg, None, PLACE_TIMEOUT)
+    }
+
+    /// 构造并接入集群：`POST /room/{id}/place` 会把会议真正建成在集群里。
+    ///
+    /// `cluster` 已经 `initialize()` 过（NATS 已连接或正在重连）。
+    pub fn with_cluster(
+        cfg: Arc<qm_common::AppConfig>,
+        cluster: Option<Arc<Cluster>>,
+        place_timeout: Duration,
+    ) -> Self {
         Self {
             cfg,
             state: Arc::new(Mutex::new(State::default())),
+            cluster,
+            place_timeout,
         }
     }
 
@@ -124,6 +154,9 @@ impl SignalRouter {
                         rooms: st.rooms.len(),
                         sdp_exchanges: st.sdp_exchanges,
                         candidates_exchanged: st.candidates_exchanged,
+                        cluster_enabled: self.cluster.is_some(),
+                        rooms_placed: st.rooms_placed,
+                        rooms_placement_failed: st.rooms_placement_failed,
                     })
                 }
                 _ => json_err(StatusCode::METHOD_NOT_ALLOWED, "healthz 只支持 GET"),
@@ -144,14 +177,19 @@ impl SignalRouter {
         if tail == "peers" {
             return match method {
                 m if m == Method::GET => {
-                    let peers = self
-                        .state
-                        .lock()
-                        .rooms
-                        .get(&room)
-                        .map(|r| r.peers.clone())
-                        .unwrap_or_default();
-                    json_ok(&PeerList { room, peers })
+                    let (peers, owner) = {
+                        let st = self.state.lock();
+                        let r = st.rooms.get(&room);
+                        (
+                            r.map(|r| r.peers.clone()).unwrap_or_default(),
+                            r.and_then(|r| r.owner.clone()),
+                        )
+                    };
+                    json_ok(&PeerList {
+                        room,
+                        peers,
+                        owner,
+                    })
                 }
                 _ => json_err(StatusCode::METHOD_NOT_ALLOWED, "peers 只支持 GET"),
             };
@@ -159,6 +197,7 @@ impl SignalRouter {
 
         match (method, tail.as_str()) {
             (m, "join") if m == Method::POST => self.join(&room, body),
+            (m, "place") if m == Method::POST => self.place(&room, body),
             (m, "offer") if m == Method::POST => self.offer(&room, body),
             (m, "candidate") if m == Method::POST => self.candidate(&room, body),
             (m, "leave") if m == Method::POST => self.leave(&room, body),
@@ -179,12 +218,41 @@ struct Health {
     rooms: usize,
     sdp_exchanges: u64,
     candidates_exchanged: u64,
+    /// 信令进程是否接入了集群（`POST /place` 是否可用）。
+    cluster_enabled: bool,
+    /// 已受理的建会议落点请求数。
+    rooms_placed: u64,
+    /// 落点失败（集群未接入 / NATS 不可用 / 超时）的次数。
+    rooms_placement_failed: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct PeerList {
     room: String,
     peers: Vec<Peer>,
+    /// 本房间的集群归属节点（信令侧记录的落点结果）。
+    owner: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PlaceBody {
+    #[serde(default = "default_streams")]
+    pub streams: u64,
+    #[serde(default)]
+    pub listeners: u64,
+}
+
+fn default_streams() -> u64 {
+    1
+}
+
+#[derive(Debug, Serialize)]
+struct Place {
+    ok: bool,
+    room: String,
+    node: String,
+    media_addr: String,
+    note: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,6 +350,98 @@ impl SignalRouter {
         json_ok(&ack(room, &m.peer, format!("已加入房间，当前 {now} 人")))
     }
 
+    /// 建会议落点（QM-024 F3）：按集群视图选一个负载最低的节点建这个房间。
+    ///
+    /// 这是集群进入真实建会议路径的那一处 —— 之前 `crates/` 之外对 `qm-cluster`
+    /// 的唯一引用是 demo 的 `--cluster` 分支，`create_room` 只有单测会调用，
+    /// 会议归属写不进 owner 索引，验收标准 1「会议落到某个节点」没有可观测证据。
+    ///
+    /// 走 [`Cluster::place_room`] 而不是 `create_room`：落点先按集群视图算出
+    /// 承载节点再委派过去（定向 request/reply），所以会议落在**哪台**节点
+    /// 是集群决策的结论，不是「谁收到请求谁就建」。
+    ///
+    /// 信令路由是同步分发，不能直接 `await` 集群，所以用当前 runtime 的
+    /// handle 执行一次带超时的 block_on。NATS 不可用（断线且未重连）会超时
+    /// 而不是假装成功 —— 会议落点必须是确定的，否则客户端会拿着一个不存在的
+    /// 节点地址去连媒体。
+    ///
+    /// `join` 保持原样：它只维护本进程的成员名单，是纯信令；落点与成员名单
+    /// 是两件独立的事，不能因为信令不可用就把集群状态改坏。
+    fn place(&self, room: &str, body: &[u8]) -> Response<String> {
+        let Some(cluster) = self.cluster.clone() else {
+            self.note_placement_failure();
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "信令未接入集群，无法创建房间（请用 --signal --cluster 启动）",
+            );
+        };
+
+        let m: PlaceBody = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("place 请求体解析失败：{e}"),
+                )
+            }
+        };
+
+        let room_id = room.to_string();
+        let timeout_secs = self.place_timeout.as_secs();
+        // 落点必须发生在信令进程的 runtime 上（`handle_request` 是 async）。
+        // 拿不到 runtime 说明调用方在同步上下文里直接调了 `route`，
+        // 与「集群不可用」同样按失败处理，不 panic。
+        let handle = tokio::runtime::Handle::try_current();
+        let future = async move { cluster.place_room(&room_id, m.streams, m.listeners).await };
+        let placed = match handle {
+            Ok(h) => h
+                .block_on(async { tokio::time::timeout(self.place_timeout, future).await })
+                .ok()
+                .and_then(|r| r.ok().flatten()),
+            Err(_) => None,
+        };
+
+        let Some(room_st) = placed else {
+            self.note_placement_failure();
+            warn!(
+                room = %room,
+                timeout_secs,
+                "会议落点失败（NATS 不可用、目标节点拒绝或超时）"
+            );
+            return json_err(
+                StatusCode::CONFLICT,
+                format!("无法创建房间 {room}：集群 NATS 未就绪或超时（{timeout_secs}s），请稍后重试"),
+            );
+        };
+
+        {
+            let mut st = self.state.lock();
+            let entry = st.rooms.entry(room.to_string());
+            let r = entry.or_default();
+            r.owner = Some(room_st.owner.clone().unwrap_or_default());
+            st.rooms_placed = st.rooms_placed.saturating_add(1);
+        }
+        debug!(
+            room = %room,
+            node = %room_st.owner.as_deref().unwrap_or_default(),
+            media = %room_st.media_addr,
+            revision = room_st.revision,
+            "会议已落点并写进集群 owner 索引"
+        );
+        json_ok(&Place {
+            ok: true,
+            room: room.to_string(),
+            node: room_st.owner.clone().unwrap_or_default(),
+            media_addr: room_st.media_addr.clone(),
+            note: format!("会议已创建在节点 {} 上", room_st.owner.as_deref().unwrap_or_default()),
+        })
+    }
+
+    fn note_placement_failure(&self) {
+        let mut st = self.state.lock();
+        st.rooms_placement_failed = st.rooms_placement_failed.saturating_add(1);
+    }
+
     fn offer(&self, room: &str, body: &[u8]) -> Response<String> {
         let m: OfferBody = match serde_json::from_slice(body) {
             Ok(v) => v,
@@ -371,6 +531,13 @@ impl SignalRouter {
 /// 服务超时时间（信令是短连接，30 秒足够）。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 一次建会议落点的等待上限（QM-024 F3）。
+///
+/// `cluster.request_create_room` 要等 NATS 句柄就绪再广播房间状态，信令进程刚起
+/// 且 NATS 还没起来时会一直等；6 秒足够覆盖一次连接重试，同时让信令线程
+/// 保持非阻塞（`route` 是同步分发，不能直接 `await`）。
+pub const PLACE_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// HTTP 适配：把 [`SignalRouter`] 包装成 hyper 的 `Service`。
 ///
 /// hyper 的 `Service` 每请求克隆一次 handler，所以路由器状态必须包在 `Arc`
@@ -457,10 +624,28 @@ async fn handle_request(
 
 /// 启动信令 HTTP 服务（只绑定配置的内网 IPv4 地址，Ctrl+C 优雅退出）。
 ///
+/// 不接入集群：`POST /room/{id}/place` 返回 503。需要会议落点时走
+/// [`start_with_cluster`] —— 集群模式的信令进程必须在同一个 NATS 里，
+/// 否则会议归属写不进去（QM-024 F3）。
+///
 /// hyper 0.14 要求 handler 先实现 `Service<AddrStream>`（每连接一个），
 /// 内层才是 `Service<Request<Body>>`。这里用 `service_fn` 做两层适配：
 /// 连接层闭包只负责克隆路由器，请求层调用 [`handle_request`]。
 pub async fn start(cfg: Arc<qm_common::AppConfig>) -> QmResult<()> {
+    start_with_cluster(cfg, None).await
+}
+
+/// 启动信令 HTTP 服务并接入集群（QM-024 F3）。
+///
+/// 这是**真实建会议路径**的入口：`--signal --cluster` 走这条，
+/// `POST /room/{id}/place` 会把会议建成在集群里并回给客户端承载节点。
+///
+/// 与 `start` 的唯一区别是多了一个集群句柄；绑定地址、端口、路由
+/// 完全一致，所以 `qm-signaling` 容器不需要改端口映射。
+pub async fn start_with_cluster(
+    cfg: Arc<qm_common::AppConfig>,
+    cluster: Option<Arc<Cluster>>,
+) -> QmResult<()> {
     let host = cfg.network.bind_host.clone();
     let port = cfg.media.signaling_port;
     let addr = SocketAddr::new(
@@ -468,8 +653,8 @@ pub async fn start(cfg: Arc<qm_common::AppConfig>) -> QmResult<()> {
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         port,
     );
-    let router = SignalRouter::new(cfg.clone());
-    tracing::info!(%host, %port, "信令服务启动（仅监听内网地址）");
+    let router = SignalRouter::with_cluster(cfg, cluster, PLACE_TIMEOUT);
+    tracing::info!(%host, %port, cluster_enabled = router.cluster.is_some(), "信令服务启动（仅监听内网地址）");
     let server = hyper::Server::bind(&addr).serve(hyper::service::make_service_fn(move |_| {
         let router = router.clone();
         async move {
@@ -638,6 +823,37 @@ mod tests {
             post(&r, "/room/m/join", b"not json").status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// 未接入集群时，`/place` 必须返回 503 而不是假装建了房间。
+    /// 静默降级成「本地建个空房间」会让客户端拿着一个不存在的节点地址去连媒体。
+    #[test]
+    fn place_requires_cluster() {
+        let r = router();
+        let body = br#"{"streams":1,"listeners":2}"#;
+        assert_eq!(
+            post(&r, "/room/meeting/place", body).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&post(&r, "/room/meeting/place", b"{}").into_body()).unwrap();
+        assert_eq!(body["ok"], false);
+        let health: serde_json::Value =
+            serde_json::from_str(&get(&r, "/healthz").into_body()).unwrap();
+        assert_eq!(health["cluster_enabled"], false);
+        assert_eq!(health["rooms_placement_failed"], 2);
+    }
+
+    /// GET /room/{id}/peers 带 `owner` 字段（未落点时为 null），
+    /// 便于客户端判断这个房间是否已经进集群。
+    #[test]
+    fn peers_reports_owner_as_null_when_not_placed() {
+        let r = router();
+        post(&r, "/room/meeting/join", br#"{"peer":"192.168.0.42:5060","peer_id":"p1"}"#);
+        let v: serde_json::Value =
+            serde_json::from_str(&get(&r, "/room/meeting/peers").into_body()).unwrap();
+        assert!(v["owner"].is_null());
+        assert_eq!(v["peers"].as_array().unwrap().len(), 1);
     }
 
     #[test]

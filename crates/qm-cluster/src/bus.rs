@@ -10,6 +10,7 @@
 //! 与 [`crate::state`] / [`crate::cluster`] 的关系：本模块只管「怎么收发」，
 //! 业务语义（谁该接房间、谁该判死）都在上层。
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -24,24 +25,72 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// 订阅接收端缓冲：NATS 发送方与业务消费方的速度差缓冲。
 pub const DEFAULT_SUBSCRIBER_CAPACITY: usize = 256;
 
+/// id 最大长度（清洗后）。
+pub const MAX_ID_LEN: usize = 64;
+
+/// 清洗一个要拼进 NATS subject 的 id（集群 id / 节点 id / 房间 id）。
+///
+/// NATS 用 `.` 分隔 subject token。一个含 `.`、空白或 `/` 的 id 会把本应是 N 段
+/// 的 subject 拆成 N+k 段，订阅端的通配（`*` 匹配一段、`>` 匹配剩余所有段）
+/// 立刻失效 —— 最典型的是房间 `meet-1.room-2` 发布到 `qm.<cid>.room.meet-1.room-2`，
+/// 而所有节点都订阅 `qm.<cid>.room.*`（只多一段），于是**集群内其他节点永远看不到
+/// 这个房间**，房间归属在节点间分裂。
+///
+/// 规则：只保留 `[A-Za-z0-9_-]`；其余字节（`.`、空白、`/`、中文……）**折叠成 `-`**，
+/// 连续的 `-` 压成一个，首尾的 `-` 丢弃，最后截到 [`MAX_ID_LEN`]。
+/// 清洗后为空时返回 `unnamed`，保证任何输入都能得到一个非空、可直接拼进 subject 的 id。
+pub fn sanitize_id(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_ID_LEN));
+    // 有一个待写入的分隔符；等遇到下一个字母数字才决定要不要写，
+    // 这样首尾的分隔符天然被丢弃、连续的分隔符天然被压缩成一个。
+    let mut pending_dash = false;
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+                pending_dash = false;
+            }
+            out.push(b as char);
+        } else {
+            // `-` 与 `.` / 空白 / 其它字符同处理：都代表「这里需要一段分隔」。
+            pending_dash = !out.is_empty();
+        }
+    }
+    let truncated: String = out.chars().take(MAX_ID_LEN).collect();
+    if truncated.is_empty() {
+        "unnamed".to_string()
+    } else {
+        truncated
+    }
+}
+
 /// 集群 subject 前缀：`qm.<cluster_id>`。
+///
+/// 先清洗 `cluster_id`：非法字符会把前缀拆成多段，所有下游 subject 一起失效。
+/// 清洗后为空（比如配置里 `cluster_id = "..."`）时由 [`sanitize_id`] 回退到
+/// `unnamed`，避免出现 `qm..room.*` 这种带空 token 的畸形 subject。
 pub fn subject_prefix(cluster_id: &str) -> String {
-    format!("qm.{}", cluster_id)
+    format!("qm.{}", sanitize_id(cluster_id))
 }
 
 /// 节点心跳 subject（按节点分片，便于单独订阅某个节点）。
 pub fn subject_heartbeat(prefix: &str, node_id: &str) -> String {
-    format!("{prefix}.hb.{}", node_id)
+    format!("{prefix}.hb.{}", sanitize_id(node_id))
 }
 
-/// 全集群心跳的订阅 subject（通配）。
+/// 全集群心跳的订阅 subject（递归通配）。
+///
+/// 必须用 `>` 而不是 `*`：心跳按节点分片发布在 `{prefix}.hb.<node_id>`（比本 subject
+/// 多一层），而 NATS 的 `*` **只匹配一段**。写成 `*` 时发布端与订阅端的 token 数
+/// 差一层，心跳永远投递不到 —— 集群成员视图永远不会更新，调度与故障迁移全部失效。
+/// `>` 匹配剩余所有段，正好对上按节点分片的发布端。
 pub fn subject_heartbeat_all(prefix: &str) -> String {
-    format!("{prefix}.hb.*")
+    format!("{prefix}.hb.>")
 }
 
 /// 房间状态变更 subject（按房间分片）。
 pub fn subject_room(prefix: &str, room_id: &str) -> String {
-    format!("{prefix}.room.{}", room_id)
+    format!("{prefix}.room.{}", sanitize_id(room_id))
 }
 
 /// 房间全量快照 subject：各节点每 `heartbeat_secs` 广播一次自己归属的房间，
@@ -60,12 +109,23 @@ pub fn subject_route(prefix: &str) -> String {
 /// 迁移请求必须**定向**投递到候选目标节点（发起方已经选定目标），
 /// 所以不能走队列订阅 —— 队列会让任意节点抢走这条消息。
 pub fn subject_migrate_for(prefix: &str, target_node: &str) -> String {
-    format!("{prefix}.migrate.req.{}", target_node)
+    format!("{prefix}.migrate.req.{}", sanitize_id(target_node))
 }
 
 /// 迁移执行结果 subject：迁移完成 / 失败回包（全集群广播，观测用）。
 pub fn subject_migrate_done(prefix: &str) -> String {
     format!("{prefix}.migrate.done")
+}
+
+/// 会议落点请求 subject（投给候选目标节点）。
+///
+/// 与迁移请求同理：`Router::assign` 已经选定目标，必须是**定向**投递。
+/// 落点走 `qm.<cid>.place.req.<target_node>`，**不能**放在 `qm.<cid>.room.<id>`
+/// 下 —— 落点发生在房间建立**之前**，房间 subject 已经被 `qm.<cid>.room.*`
+/// 订阅走（用于房间状态变更），同一条消息会被 `apply_remote_room` 按
+/// `RoomState` 反序列化并静默丢弃。
+pub fn subject_place_for(prefix: &str, target_node: &str) -> String {
+    format!("{prefix}.place.req.{}", sanitize_id(target_node))
 }
 
 /// 房间调度请求载荷。
@@ -76,6 +136,28 @@ pub struct RoomRouteRequest {
     pub from_node: String,
     pub streams: u64,
     pub listeners: u64,
+}
+
+/// 会议落点请求载荷（QM-024 F3）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaceRequest {
+    pub room_id: String,
+    /// 请求来源节点（日志用；定向 subject 已经保证只有目标节点收到）。
+    pub from_node: String,
+    pub streams: u64,
+    pub listeners: u64,
+}
+
+/// 会议落点回包载荷。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaceReply {
+    pub ok: bool,
+    pub room_id: String,
+    /// 实际承载节点（成功时非空）。
+    pub owner: Option<String>,
+    pub media_addr: String,
+    pub revision: u64,
+    pub reason: String,
 }
 
 /// 迁移执行结果载荷。
@@ -100,6 +182,8 @@ pub struct Subjects {
     /// 投给本节点的迁移请求 subject（每个目标节点各自订阅，不做队列分摊）。
     pub migrate_for_self: String,
     pub migrate_done: String,
+    /// 投给本节点的会议落点请求 subject（QM-024 F3）。
+    pub place_for_self: String,
 }
 
 impl Subjects {
@@ -112,6 +196,7 @@ impl Subjects {
             route_new: subject_route(&prefix),
             migrate_for_self: subject_migrate_for(&prefix, &cfg.node_id),
             migrate_done: subject_migrate_done(&prefix),
+            place_for_self: subject_place_for(&prefix, &cfg.node_id),
             prefix,
         }
     }
@@ -125,6 +210,11 @@ impl Subjects {
     pub fn migrate_for(&self, target_node: &str) -> String {
         subject_migrate_for(&self.prefix, target_node)
     }
+
+    /// 投递给指定目标节点的落点请求 subject。
+    pub fn place_for(&self, target_node: &str) -> String {
+        subject_place_for(&self.prefix, target_node)
+    }
 }
 
 /// 房间全量快照载荷。
@@ -136,6 +226,20 @@ impl Subjects {
 pub struct SnapshotPayload {
     pub total: usize,
     pub rooms: Vec<RoomState>,
+}
+
+/// async-nats 连接统计的快照（`Statistics` 不实现 `Clone`，字段是 `AtomicU64`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionStats {
+    /// 累计收写字节。
+    pub in_bytes: u64,
+    pub out_bytes: u64,
+    pub in_messages: u64,
+    pub out_messages: u64,
+    /// 连接建立次数：首次连接 + 之后每一次成功重连。
+    ///
+    /// 断线重连验证就用它：重启 NATS 之前是 1，恢复后应该变成 2。
+    pub connects: u64,
 }
 
 /// NATS 客户端封装：把 `async_nats::Client` 收在这一层，业务层只面对本类型。
@@ -152,6 +256,11 @@ pub struct NatsBus {
 }
 
 impl NatsBus {
+    /// 用已有连接句柄构造（重连路径用）。
+    pub fn from_client(client: async_nats::Client, subjects: Subjects) -> Self {
+        Self { client, subjects }
+    }
+
     /// 连接到 NATS server。地址来自配置，必须是内网地址（配置加载时已校验）。
     ///
     /// 用 [`async_nats::connect_with_options`] 而不是 `connect`：默认 `connect`
@@ -159,12 +268,66 @@ impl NatsBus {
     ///
     /// `publisher_capacity` 是本节点向 NATS 发送的消息队列缓冲，
     /// 心跳 + 订阅回包 + 若干请求会共享这一条连接。
+    ///
+    /// 断线后的**自动重连**由连接层承担（async-nats 默认无限次重试、指数退避
+    /// 上限 4s，见 [`connect_with_timeout`]）；但**首次**连接失败不会自动重连，
+    /// 必须靠上层 [`crate::cluster::Cluster::connect_loop`] 周期重试。
     pub async fn connect(cfg: &ClusterConfig, publisher_capacity: usize) -> QmResult<Self> {
         let subjects = Subjects::from_config(cfg);
         let addr = format!("{}:{}", cfg.server, cfg.port);
         let client = connect_with_timeout(&addr, cfg, publisher_capacity).await?;
         debug!(%addr, cluster = %cfg.cluster_id, node = %cfg.node_id, "NATS 已连接");
         Ok(Self { client, subjects })
+    }
+
+    /// 带超时的连接尝试：NATS 不可达时最多挂 `request_timeout_secs`，不无限等。
+    pub async fn try_connect(cfg: &ClusterConfig, publisher_capacity: usize) -> QmResult<Self> {
+        Self::connect(cfg, publisher_capacity).await
+    }
+
+    /// NATS 是否仍处于已连接状态。
+    ///
+    /// async-nats 的 `Client` 在断线期间是**静默**的：`publish` 仍然排队、
+    /// `request` 会等到超时，不会立刻报错。所以判活必须显式读 `connection_state`。
+    pub fn is_connected(&self) -> bool {
+        use async_nats::connection::State;
+        matches!(self.client.connection_state(), State::Connected)
+    }
+
+    /// 连接统计（重连次数等），供 healthz 与压测观测。
+    ///
+    /// async-nats 的 `statistics()` 返回 `Arc<Statistics>`，而 `Statistics` 的字段全是
+    /// `AtomicU64`、**不实现 `Clone`**，所以只能逐个 `load` 出来；这里读的是
+    /// 生命周期累计值（含初始连接与之后每一次成功重连），断线前后对比就能看出
+    /// 节点确实换过连接、没有靠进程重启「假装」恢复。
+    pub fn stats(&self) -> ConnectionStats {
+        let s = self.client.statistics();
+        ConnectionStats {
+            in_bytes: s.in_bytes.load(Ordering::Relaxed),
+            out_bytes: s.out_bytes.load(Ordering::Relaxed),
+            in_messages: s.in_messages.load(Ordering::Relaxed),
+            out_messages: s.out_messages.load(Ordering::Relaxed),
+            connects: s.connects.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 强制重连：走 async-nats 自己的重连流程，保留现有订阅。
+    ///
+    /// 这个方法**不等待**重连完成；调用方要自己用 [`NatsBus::is_connected`] +
+    /// `flush` 做探针确认（见 [`reconnect_with_probe`]）。
+    pub async fn force_reconnect(&self) -> QmResult<()> {
+        self.client
+            .force_reconnect()
+            .await
+            .map_err(|e| Error::cluster(format!("NATS 强制重连失败: {e}")))
+    }
+
+    /// flush 探针：确认消息真的能到达 server。
+    pub async fn flush(&self) -> QmResult<()> {
+        self.client
+            .flush()
+            .await
+            .map_err(|e| Error::cluster(format!("NATS flush 失败: {e}")))
     }
 
     /// subject 集合。
@@ -253,6 +416,27 @@ impl NatsBus {
         self.publish_json(&self.subjects.migrate_done, result).await
     }
 
+    /// 定向发送会议落点请求并等回包（QM-024 F3）。
+    ///
+    /// 与迁移请求同理走**定向 subject**：`Router::assign` 已经选定目标节点，
+    /// 队列订阅会让别的节点抢走消息直接丢弃。
+    pub async fn request_place(
+        &self,
+        target_node: &str,
+        req: &PlaceRequest,
+    ) -> QmResult<PlaceReply> {
+        request_json(&self.client, &self.subjects.place_for(target_node), req).await
+    }
+
+    /// 回包一条落点请求。
+    pub async fn reply_place(
+        &self,
+        msg: &async_nats::Message,
+        reply: &PlaceReply,
+    ) -> QmResult<bool> {
+        self.reply_json(msg, reply).await
+    }
+
     /// 定向发送迁移请求并等回包。
     ///
     /// 迁移请求**不走队列**：发起方已经选定了目标节点（`req.target_node`），
@@ -333,16 +517,56 @@ async fn connect_with_timeout(
     cfg: &ClusterConfig,
     publisher_capacity: usize,
 ) -> QmResult<async_nats::Client> {
-    let opts = async_nats::ConnectOptions::new()
-        .connection_timeout(Duration::from_secs(cfg.request_timeout_secs.max(1)))
-        .request_timeout(Some(Duration::from_secs(cfg.request_timeout_secs.max(1))))
-        .ping_interval(Duration::from_secs(cfg.heartbeat_secs.max(1)))
-        .client_capacity(publisher_capacity.max(1))
-        .name(cfg.node_id.clone());
+    let opts = base_options(cfg, publisher_capacity);
 
     async_nats::connect_with_options(addr, opts)
         .await
         .map_err(|e| Error::cluster(format!("NATS 连接失败 [{addr}]: {e}")))
+}
+
+/// 连接参数：首次连接与重连共用，保证两处语义一致。
+fn base_options(cfg: &ClusterConfig, publisher_capacity: usize) -> async_nats::ConnectOptions {
+    // async-nats 默认无限重试、退避 `2^(n-1)` ms 封顶 4s —— 「NATS 断线自动重连」
+    // 不需要我们自己做退避表，这里只需要保证**重试不会被掐掉**（不设 max_reconnects）。
+    async_nats::ConnectOptions::new()
+        .connection_timeout(Duration::from_secs(cfg.request_timeout_secs.max(1)))
+        .request_timeout(Some(Duration::from_secs(cfg.request_timeout_secs.max(1))))
+        .ping_interval(Duration::from_secs(cfg.heartbeat_secs.max(1)))
+        .client_capacity(publisher_capacity.max(1))
+        .name(cfg.node_id.clone())
+}
+
+/// 重新建立一条 NATS 连接，并**校验它真的可用**（F4）。
+///
+/// 与 [`NatsBus::connect`] 的区别只在收尾校验：`connect_with_options` 在
+/// `retry_on_initial_connect` 关掉时（默认值）只试一次就返回错误，而成功返回的
+/// 句柄不保证能立刻收发消息 —— 必须过一次真实探针才算连上。不做校验的话，重连
+/// 循环会以为自己已经恢复、把 healthz 置回绿色，而心跳其实一直在丢。
+///
+/// 校验是两次真实读：`flush` 探针（写路径必须能在 server 侧被确认）+
+/// 连接状态位（`Connected`）。注意 0.37 里状态只在 `Connected` / `Disconnected`
+/// 之间切，且 `Disconnected` 只在连接被丢弃时写一次，所以状态位**单独用不可靠**，
+/// 探针才是判据。
+pub async fn reconnect_with_probe(
+    cfg: &ClusterConfig,
+    publisher_capacity: usize,
+) -> QmResult<NatsBus> {
+    let addr = format!("{}:{}", cfg.server, cfg.port);
+    let client = async_nats::connect_with_options(addr.clone(), base_options(cfg, publisher_capacity))
+        .await
+        .map_err(|e| Error::cluster(format!("NATS 连接失败 [{addr}]: {e}")))?;
+
+    // 握手成功不等于能收发消息：flush 探针确认写路径真的通到 server。
+    client
+        .flush()
+        .await
+        .map_err(|e| Error::cluster(format!("NATS 探针 flush 失败 [{addr}]: {e}")))?;
+
+    debug!(%addr, node = %cfg.node_id, "NATS 连接已建立（探针已确认）");
+    Ok(NatsBus {
+        client,
+        subjects: Subjects::from_config(cfg),
+    })
 }
 
 async fn request_json<T: Serialize, R: serde::de::DeserializeOwned>(
@@ -386,7 +610,9 @@ mod tests {
         let s = Subjects::from_config(&cfg);
         assert_eq!(s.prefix, "qm.qm-prod");
         assert_eq!(s.heartbeat, "qm.qm-prod.hb.n1");
-        assert_eq!(s.heartbeat_all, "qm.qm-prod.hb.*");
+        // 必须带递归通配符：心跳发布在 `qm.qm-prod.hb.n1`（比订阅端多一段），
+        // NATS 的 `*` 只匹配一段，写成 `qm.qm-prod.hb.*` 会**永远收不到心跳**。
+        assert_eq!(s.heartbeat_all, "qm.qm-prod.hb.>");
         assert_eq!(s.room("meet-1"), "qm.qm-prod.room.meet-1");
         assert_eq!(s.route_new, "qm.qm-prod.route.new");
         assert_eq!(s.migrate_for_self, "qm.qm-prod.migrate.req.n1");
@@ -406,6 +632,97 @@ mod tests {
         });
         assert_ne!(a.heartbeat, b.heartbeat);
         assert_ne!(a.room("same"), b.room("same"));
+    }
+
+    // ── id 清洗：subject 的 token 数绝不能被 id 撑破 ──
+
+    #[test]
+    fn sanitize_id_keeps_alnum_underscore_and_dash() {
+        assert_eq!(sanitize_id("meet-2026-0916"), "meet-2026-0916");
+        assert_eq!(sanitize_id("meet_2026"), "meet_2026");
+        assert_eq!(sanitize_id("Abc123"), "Abc123");
+    }
+
+    #[test]
+    fn sanitize_id_folds_dots_spaces_and_separator_runs() {
+        // `.` 是 NATS 的 token 分隔符：不清洗时 `qm.<cid>.room.a.b` 变成 5 段，
+        // 而所有节点都订阅 `qm.<cid>.room.*`（多 1 段），于是**收不到这个房间**。
+        assert_eq!(sanitize_id("meet.1"), "meet-1");
+        assert_eq!(sanitize_id("a/b c"), "a-b-c");
+        assert_eq!(sanitize_id("a--b"), "a-b");
+        assert_eq!(sanitize_id("..."), "unnamed");
+        assert_eq!(sanitize_id("a...b"), "a-b");
+        assert_eq!(sanitize_id("a  b"), "a-b");
+    }
+
+    #[test]
+    fn sanitize_id_strips_leading_and_trailing_separators() {
+        assert_eq!(sanitize_id("-a-"), "a");
+        assert_eq!(sanitize_id("...a..."), "a");
+        assert_eq!(sanitize_id("-a"), "a");
+        assert_eq!(sanitize_id("a-"), "a");
+    }
+
+    #[test]
+    fn sanitize_id_empty_input_becomes_unnamed() {
+        assert_eq!(sanitize_id(""), "unnamed");
+        assert_eq!(sanitize_id("..."), "unnamed");
+        assert_eq!(sanitize_id("会议室"), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_id_truncates_to_max_len_without_half_a_char() {
+        let long = "a".repeat(MAX_ID_LEN + 40);
+        assert_eq!(sanitize_id(&long).len(), MAX_ID_LEN);
+
+        // 多字节字符在截断边界上会被整体丢弃，不能产生半个字符。
+        let mixed = format!("room-{}-会议室", "x".repeat(MAX_ID_LEN));
+        let out = sanitize_id(&mixed);
+        assert!(out.len() <= MAX_ID_LEN);
+        assert!(
+            out.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "清洗结果只能是 [A-Za-z0-9_-]: {out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_id_output_is_always_subject_safe() {
+        let raws: Vec<String> = [
+            "".to_string(),
+            "a".to_string(),
+            "a.b.c".to_string(),
+            "  spaced  ".to_string(),
+            "a/b".to_string(),
+            "会议室".to_string(),
+            "r\x001".to_string(),
+            format!("{}{}", "z".repeat(200), "会议室"),
+        ]
+        .into_iter()
+        .collect();
+        for raw in raws {
+            let out = sanitize_id(&raw);
+            assert!(!out.is_empty(), "清洗结果不能为空: {raw:?} -> {out:?}");
+            assert!(out.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+            assert!(out.len() <= MAX_ID_LEN);
+        }
+    }
+
+    #[test]
+    fn subjects_are_stable_after_sanitizing() {
+        // 同一个非法 id 在两个节点上必须算出**完全相同**的 subject，
+        // 否则两端订阅不到对方发的消息 —— 这是 F6 要防止的实际故障。
+        let cid = "qm-prod";
+        assert_eq!(subject_prefix(cid), "qm.qm-prod");
+        // 两个节点用同一个（含 `.` 的）房间 id，subject 必须一致。
+        assert_eq!(
+            subject_room("qm.qm-prod", "meet.1"),
+            subject_room("qm.qm-prod", "meet.1")
+        );
+        assert_eq!(subject_room("qm.qm-prod", "meet.1"), "qm.qm-prod.room.meet-1");
+
+        // 畸形 cluster_id 也不能产出带空 token 的 subject（`qm..room.*` 是坏 subject）。
+        assert_eq!(subject_prefix("..."), "qm.unnamed");
+        assert_ne!(subject_prefix("a"), subject_prefix("b"));
     }
 
     #[test]

@@ -309,15 +309,28 @@ pub struct Registry {
     node_id: String,
     nodes: HashMap<String, Node>,
     rooms: HashMap<String, RoomState>,
+    /// 未完成的故障迁移（`failover_target_secs` 宽限期内失败过、等待重试）。
+    failover_retry: HashMap<String, PendingMigration>,
+}
+
+/// 一次未完成的故障迁移：`Registry::record_migration_failure` 写入，
+/// 下一轮 [`Cluster::health_check`] 通过 [`Registry::pending_migrations`] 取出来重试。
+#[derive(Debug, Clone)]
+pub struct PendingMigration {
+    pub room_id: String,
+    pub source_node: String,
+    /// 上一次尝试的目标节点（重试时排除掉它，避免反复撞同一台机器）。
+    pub last_target: String,
+    pub first_attempt_ms: u64,
+    pub deadline_ms: u64,
+    pub attempts: u64,
 }
 
 impl Registry {
     pub fn new(node_id: impl Into<String>) -> Self {
-        Self {
-            node_id: node_id.into(),
-            nodes: HashMap::new(),
-            rooms: HashMap::new(),
-        }
+        let mut reg = Self::default();
+        reg.node_id = node_id.into();
+        reg
     }
 
     pub fn node_id(&self) -> &str {
@@ -342,10 +355,74 @@ impl Registry {
         }
     }
 
-    /// 健康窗口：`heartbeat_secs × unhealthy_misses`。
+    // ── 故障迁移重试（QM-024 F5：failover_target_secs 不再只是装饰值）──
+
+    /// 记录一次迁移失败，并在 `failover_target_secs` 宽限期内安排重试。
+    ///
+    /// 返回 `true` 表示仍在宽限期内、应该继续重试；`false` 表示宽限期已过 ——
+    /// 超时被**显式返回**，调用方据此打放弃告警，迁移失败不会静默丢失。
+    ///
+    /// 宽限期从**首次**失败起算（`first_attempt_ms` 不在重试时重置），否则重试
+    /// 会无限期推迟截止点，`failover_target_secs` 又退回一个写进日志的数字。
+    ///
+    /// 没有这个机制时：健康检查每 `heartbeat_secs` 跑一次，一次 `Err` 之后房间归属
+    /// 就永远停在源节点上。
+    pub fn record_migration_failure(
+        &mut self,
+        room_id: &str,
+        source_node: &str,
+        target_node: &str,
+        failover_target_secs: u64,
+    ) -> bool {
+        let now = unix_ms();
+        let deadline = now
+            .saturating_add(failover_target_secs.saturating_mul(1000));
+        let entry = self
+            .failover_retry
+            .entry(room_id.to_string())
+            .or_insert_with(|| PendingMigration {
+                room_id: room_id.to_string(),
+                source_node: source_node.to_string(),
+                last_target: target_node.to_string(),
+                first_attempt_ms: now,
+                deadline_ms: deadline,
+                attempts: 0,
+            });
+        entry.attempts += 1;
+        entry.last_target = target_node.to_string();
+        now < entry.deadline_ms
+    }
+
+    /// 迁移成功（或已放弃）时清掉重试记录。
+    pub fn clear_migration_failure(&mut self, room_id: &str) {
+        self.failover_retry.remove(room_id);
+    }
+
+    /// 取出「宽限期内失败过、下一轮应重试」的迁移任务；已过期的条目被清掉。
+    pub fn pending_migrations(&mut self) -> Vec<PendingMigration> {
+        let now = unix_ms();
+        let mut out = Vec::new();
+        self.failover_retry.retain(|_, e| {
+            if now >= e.deadline_ms {
+                false
+            } else {
+                out.push(e.clone());
+                true
+            }
+        });
+        out
+    }
+
+    /// 健康窗口（**毫秒**）：`heartbeat_secs × unhealthy_misses × 1000`。
+    ///
+    /// 返回毫秒而不是秒 —— `last_seen_ms` 是 Unix 毫秒，`reap_dead` / `is_healthy`
+    /// 拿这个值和 `now_ms` 直接比较。少乘 1000 时窗口只有 2 毫秒，任何一次
+    /// 「心跳还在发、接收端恰好慢一拍」的竞态都会把健康节点判成 Dead，
+    /// 集群会永久性地全员抖动，故障迁移也就永远选不到候选节点。
     pub fn health_window(cfg: &ClusterConfig) -> u64 {
         cfg.heartbeat_secs
             .saturating_mul(cfg.unhealthy_misses.max(1))
+            .saturating_mul(1000)
     }
 
     /// 节点是否在健康窗口内。
@@ -413,6 +490,30 @@ impl Registry {
             }
         }
         dead
+    }
+
+    /// 把**超出宽限期**的死节点从视图里摘掉，返回被摘掉的节点 id。
+    ///
+    /// 为什么要摘：死节点会永远滞留在 `nodes` 表里（判死后不会再有心跳回来
+    /// 复活它），于是 `cluster_nodes` 越滚越大、`migration_destination` 的候选
+    /// 池里永远混着僵尸节点。摘掉之后「节点动态增减」才算真的成立：
+    /// 下线一个节点，集群规模会**回落**，而不是只增不减。
+    ///
+    /// 宽限期 `grace_ms` 必须覆盖健康窗口 —— 否则迁移还没跑完就把源节点从视图里
+    /// 拿掉，源节点自己那台机器上的房间归属就再也没人认账。
+    pub fn prune_dead(&mut self, now_ms: u64, grace_ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        self.nodes.retain(|id, node| {
+            if node.status == NodeStatus::Dead
+                && node.dead_since_ms.map(|t| t.saturating_add(grace_ms) < now_ms).unwrap_or(false)
+            {
+                out.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        out
     }
 
     /// 应用一条房间状态更新，按 `revision` 收敛。
@@ -949,7 +1050,189 @@ mod tests {
             unhealthy_misses: 2,
             ..ClusterConfig::default()
         };
-        assert_eq!(Registry::health_window(&cfg), 10);
+        assert_eq!(
+            Registry::health_window(&cfg),
+            10_000,
+            "窗口必须以毫秒为单位：`last_seen_ms` 是 Unix 毫秒"
+        );
+    }
+
+    #[test]
+    fn reap_dead_uses_a_healthy_window_not_a_two_millisecond_window() {
+        // 回归用例：窗口曾按秒返回（`heartbeat_secs × unhealthy_misses`），
+        // 与毫秒级的 `last_seen_ms` 直接比较 → 窗口只有 2 毫秒。
+        // 那样的集群会在正常运行下周期性把健康节点判成 Dead，
+        // 故障迁移永远选不到候选节点（三次实测的 `n0/n1/n2 同时 Dead` 抖动就是这个）。
+        let cfg = ClusterConfig {
+            heartbeat_secs: 1,
+            unhealthy_misses: 5,
+            ..ClusterConfig::default()
+        };
+        let mut reg = Registry::with_nodes("me", [node("n1", 20_000, 200)]);
+        let now = unix_ms();
+
+        // 1s 前刚收到过心跳：真实节点、真实 NATS 传输的正常抖动范围。
+        {
+            let mut n = reg.node("n1").unwrap().clone();
+            n.last_seen_ms = now.saturating_sub(1000);
+            reg.insert_node(n);
+        }
+        let dead = reg.reap_dead(&cfg, now);
+        assert!(
+            dead.is_empty(),
+            "1s 前刚有心跳的节点不能被判死（窗口应为 {window}ms，实际判定为 {dead:?}）",
+            window = Registry::health_window(&cfg)
+        );
+
+        // 超过窗口 + 半个周期 → 必须判死。
+        let far = now.saturating_sub(Registry::health_window(&cfg).saturating_add(500));
+        {
+            let mut n = reg.node("n1").unwrap().clone();
+            n.last_seen_ms = far;
+            reg.insert_node(n);
+        }
+        assert_eq!(reg.reap_dead(&cfg, now), vec!["n1".to_string()]);
+    }
+
+    // ── 迁移重试（failover_target_secs 的真实语义）──
+
+    #[test]
+    fn migration_failure_retry_window_is_counted_from_first_attempt() {
+        let mut reg = Registry::new("me");
+        let deadline_secs = 10u64;
+
+        // 第一次失败：仍在宽限期内 → 应继续重试。
+        assert!(reg.record_migration_failure("r1", "n1", "n2", deadline_secs));
+        // 第二次失败：宽限期从**第一次**起算，不能被重试反复推迟。
+        assert!(reg.record_migration_failure("r1", "n1", "n3", deadline_secs));
+
+        let pending = reg.pending_migrations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].room_id, "r1");
+        assert_eq!(pending[0].attempts, 2);
+        assert_eq!(pending[0].last_target, "n3", "重试时要排除最近一次失败的目标");
+        assert_eq!(pending[0].deadline_ms - pending[0].first_attempt_ms, deadline_secs * 1000);
+
+        reg.clear_migration_failure("r1");
+        assert!(reg.pending_migrations().is_empty(), "成功后重试记录必须清掉");
+    }
+
+    #[test]
+    fn migration_failure_expires_after_the_window() {
+        let mut reg = Registry::new("me");
+        let now = unix_ms();
+        // 手工种一条 60s 前开始的失败记录，宽限期 10s → 已超期。
+        reg.failover_retry.insert(
+            "r1".to_string(),
+            PendingMigration {
+                room_id: "r1".to_string(),
+                source_node: "n1".to_string(),
+                last_target: "n2".to_string(),
+                first_attempt_ms: now.saturating_sub(60_000),
+                deadline_ms: now.saturating_sub(50_000),
+                attempts: 3,
+            },
+        );
+
+        // 记录失败的宽限期判定必须看**已有条目的截止点**，不能用新的 deadline 顶掉它，
+        // 否则每次重试都会把截止点往后推，`failover_target_secs` 就只是日志里的数字。
+        assert!(
+            !reg.record_migration_failure("r1", "n1", "n2", 10),
+            "超期后必须返回放弃，不能因为又失败一次而重新计时"
+        );
+
+        // 过期条目由 pending_migrations 清理，不会无限期滞留。
+        let pending = reg.pending_migrations();
+        assert!(pending.is_empty(), "超过宽限期的迁移不该再重试");
+        assert!(
+            reg.failover_retry.is_empty(),
+            "超期条目应被清理，不能无限期滞留"
+        );
+
+        // 清理后重新失败 → 视为一次全新的宽限期。
+        assert!(reg.record_migration_failure("r1", "n1", "n2", 10), "清理后重新计时");
+        assert_eq!(reg.pending_migrations().len(), 1);
+    }
+
+    #[test]
+    fn migration_failure_tracks_each_room_independently() {
+        let mut reg = Registry::new("me");
+        assert!(reg.record_migration_failure("r1", "n1", "n2", 10));
+        assert!(reg.record_migration_failure("r2", "n1", "n3", 10));
+        reg.clear_migration_failure("r1");
+
+        let pending = reg.pending_migrations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].room_id, "r2", "清一个房间的失败不能影响别的房间");
+    }
+
+    // ── 死节点回收（成员视图必须能回落）──
+
+    #[test]
+    fn prune_dead_removes_only_past_grace() {
+        let now = unix_ms();
+        let mut reg = Registry::with_nodes("me", [node("n1", 20_000, 200)]);
+
+        // 判死后立刻摘是错的：迁移可能还没跑完。
+        {
+            let mut n = reg.node("n1").unwrap().clone();
+            n.status = NodeStatus::Dead;
+            n.dead_since_ms = Some(now);
+            reg.insert_node(n);
+        }
+        assert_eq!(reg.nodes().count(), 1, "刚判死不应立刻摘除");
+        assert!(
+            reg.prune_dead(now, 60_000).is_empty(),
+            "宽限期内不摘"
+        );
+
+        // 超期后摘除。
+        let pruned = reg.prune_dead(now + 61_000, 60_000);
+        assert_eq!(pruned, vec!["n1".to_string()]);
+        assert_eq!(reg.nodes().count(), 0, "超期后成员视图必须回落");
+
+        // 再摘一次是幂等的。
+        assert!(reg.prune_dead(now + 120_000, 60_000).is_empty());
+    }
+
+    #[test]
+    fn prune_dead_ignores_live_nodes_without_dead_since() {
+        // 判死但未设置 dead_since_ms 的节点（历史数据 / 异常路径）不能被误摘。
+        let mut reg = Registry::with_nodes("me", [node("n1", 20_000, 200)]);
+        {
+            let mut n = reg.node("n1").unwrap().clone();
+            n.status = NodeStatus::Dead;
+            n.dead_since_ms = None;
+            reg.insert_node(n);
+        }
+        assert!(reg.prune_dead(unix_ms(), 1).is_empty(), "缺 dead_since_ms 时不摘");
+        assert_eq!(reg.nodes().count(), 1);
+    }
+
+    #[test]
+    fn prune_dead_covers_the_failover_window() {
+        // 宽限期必须覆盖「健康窗口 + 迁移时限」：本用例验证 grace 取两者之和时，
+        // 迁移时限内源节点仍然可见（否则归属无人认账）。
+        let cfg = ClusterConfig {
+            heartbeat_secs: 5,
+            unhealthy_misses: 2,
+            failover_target_secs: 10,
+            ..ClusterConfig::default()
+        };
+        let grace_ms =
+            Registry::health_window(&cfg) + cfg.failover_target_secs * 1000;
+        assert_eq!(grace_ms, 20_000);
+
+        let now = unix_ms();
+        let mut reg = Registry::with_nodes("me", [node("n1", 20_000, 200)]);
+        {
+            let mut n = reg.node("n1").unwrap().clone();
+            n.status = NodeStatus::Dead;
+            n.dead_since_ms = Some(now);
+            reg.insert_node(n);
+        }
+        assert!(reg.prune_dead(now.saturating_add(grace_ms), grace_ms).is_empty(), "迁移时限内不摘");
+        assert!(!reg.prune_dead(now.saturating_add(grace_ms + 1), grace_ms).is_empty());
     }
 
     fn insert_rooms(reg: Registry, rooms: impl IntoIterator<Item = RoomState>) -> Registry {

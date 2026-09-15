@@ -187,6 +187,15 @@ services:
 
   # 信令服务：独立进程，与媒体层同网段，只做内网信令路由。
   # 扩容媒体节点时不需要再加信令实例 —— 信令只负责内网信令路由。
+  #
+  # QM-024 F3：信令进程同时作为一个集群节点加入 NATS（`--signal --cluster`）。
+  # 这样 `POST /room/{id}/place` 的落点才发生在真实的建会议路径上 ——
+  # 只跑 `--signal` 时该端点返回 503（集群未接入），会议归属写不进 owner 索引。
+  #
+  # 角色给 listener 而不是 full：旁听节点 `is_schedulable()` 为 false，
+  # `Router::assign` / `migration_destination` 都不会选它，所以它只负责
+  # 「把落点请求委派出去」，不会把媒体房间抢到自己身上（它本身不跑媒体面）。
+  # 代价是它不承接故障迁移，集群里可承接迁移的仍是 node-1/2/3 三台。
   qm-signaling:
     build:
       context: .
@@ -203,7 +212,13 @@ services:
       - meeting-data:/opt/quickmeet/data:ro
     networks:
       - quickmeet
-    command: "./target/release/qm-demo --bind 0.0.0.0 --signal"
+    # 集群模式下信令进程自己连 NATS 并加入成员视图；节点身份必须唯一。
+    environment:
+      - QM_CLUSTER_NODE_ID=node-signal
+      # 该节点从不承载媒体房间，地址仅用于标识，与信令端口一致。
+      - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.21:8081
+      - QM_CLUSTER_NODE_ROLE=listener
+    command: "./target/release/qm-demo --bind 0.0.0.0 --signal --cluster"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8081/healthz"]
       interval: 5s
