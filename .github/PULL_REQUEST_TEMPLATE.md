@@ -4,7 +4,7 @@ PR 标题约定（强制）：`QM-00x: 简短中文说明`
 
 标题必须带 Issue 编号，否则：
   * 无法与 Issue 自动关联（QEJ-109 / QM-018 的验收标准 1）
-  * CI 的 `pr-title` job 会直接失败并打回
+  * CI 的 **PR 标题 QM-00x: xxx 约定** job 会直接失败并打回
 分支命名：`qm-<编号>-<短描述>`，例 `qm-006-cluster`
 -->
 
@@ -38,10 +38,12 @@ PR 标题约定（强制）：`QM-00x: 简短中文说明`
 补充：哪些步骤因为本机环境缺依赖被 SKIP（例如未装 docker / docker-compose），
 以及 CI 上对应 job 名：
 
-- 本机构建与测试：`rust-msrv`
-- 容器构建与四容器健康检查：`compose-legacy`
-- MSVC + webrtc 特性：`windows-webrtc`
-- PR 标题约定：`pr-title`
+CI 里 4 个 check（`gh pr checks` 与分支保护认的是**显示名**，不是 job id）：
+
+- 本机构建与测试：`ubuntu / Rust 1.75 / workspace 全绿`（job id `rust-msrv`）
+- 容器构建与四容器健康检查：`ubuntu / docker-compose 1.29.2 / 容器健康检查`（`compose-legacy`）
+- MSVC + webrtc 特性：`windows-latest / MSVC / qm-media --features webrtc`（`windows-webrtc`）
+- PR 标题约定：`PR 标题 QM-00x: xxx 约定`（`pr-title`）
 
 ## 跨文件依赖 / 兼容性
 

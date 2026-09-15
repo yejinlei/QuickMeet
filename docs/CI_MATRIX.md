@@ -5,12 +5,20 @@
 
 ## 0. CI job 一览
 
-| Job 名（`.github/workflows/ci.yml`） | 运行环境 | 做什么 | 超时 |
+| Job id → check-run 显示名 | 运行环境 | 做什么 | 超时 |
 | --- | --- | --- | --- |
-| `rust-msrv` | ubuntu-22.04 + Rust **1.75** | MSRV 检查、`fmt --check`、`clippy`（本 PR 触碰的 crate 硬挡 `-D warnings`；workspace 全量只作提示）、`cargo test --workspace --locked`、`cargo build --release`、`qm-demo` 默认命令 + 端口假设 | 15 min |
-| `compose-legacy` | ubuntu-22.04 + docker + **docker-compose 1.29.2** | Dockerfile 构建、compose 语法与 1.29.2 兼容校验、`up -d --build`、五容器健康检查、`/healthz` 探活、逐个 restart 自愈验证 | 15 min |
-| `windows-webrtc` | windows-latest + MSVC `cl.exe` | `cargo test -p qm-media --features webrtc --locked`（本机只有 MinGW，跑不到这一条） | 15 min |
-| `pr-title` | ubuntu-22.04 | PR 标题必须匹配 `^(QM-\d{3}\|YEJ-\d+): .+`，固化标题约定并保证 Issue 自动关联 | 5 min |
+| `rust-msrv` → **ubuntu / Rust 1.75 / workspace 全绿** | ubuntu-22.04 + Rust **1.75** | MSRV 检查、`fmt --check`、`clippy`（本 PR 触碰的 crate 硬挡 `-D warnings`；workspace 全量只作提示）、`cargo test --workspace --locked`、`cargo build --release`、`qm-demo` 默认命令 + 端口假设 | 15 min |
+| `compose-legacy` → **ubuntu / docker-compose 1.29.2 / 容器健康检查** | ubuntu-22.04 + docker + **docker-compose 1.29.2** | Dockerfile 构建、compose 语法与 1.29.2 兼容校验、`up -d --build`、五容器健康检查、`/healthz` 探活、逐个 restart 自愈验证 | 15 min |
+| `windows-webrtc` → **windows-latest / MSVC / qm-media --features webrtc** | windows-latest + MSVC `cl.exe` | `cargo test -p qm-media --features webrtc --locked`（本机只有 MinGW，跑不到这一条） | 15 min |
+| `pr-title` → **PR 标题 QM-00x: xxx 约定** | ubuntu-22.04 | PR 标题必须匹配 `^(QM-\d{3}\|YEJ-\d+): .+`，固化标题约定并保证 Issue 自动关联 | 5 min |
+
+> **两个名字别混用**：`rust-msrv` 这类是 workflow 里的 `jobs.<id>`，
+> 只在 `needs:` / `${{ }}` 表达式里有效；**分支保护的
+> `required_status_checks.contexts` 与 `gh pr checks` 认的是右边那个显示名**
+> （`jobs.<id>.name`，没写 `name` 时才退回 id）。id 里原来带点号（`rust-1.75`、
+> `compose-1.29.2`）时 Actions 会把它当成 JSONPath 报
+> `Can get expression value only for Object or Array, got: 'Number'`，
+> 整个 workflow 直接不执行 —— 所以 id 已经改成无点号，显示名保留完整描述。
 
 约束达成情况（Issue 强制约束）：
 
@@ -121,9 +129,9 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
 
 | # | 验收项 | 覆盖 | 由谁覆盖 |
 | --- | --- | --- | --- |
-| 1 | 远端仓库可见、4 个提交与分支可 push、PR 可创建并关联 Issue | 半自动 | push 与 PR 创建是一次性人工动作（本次交付已做）；`pr-title` job 自动守住标题约定，标题带编号 Issue 才会自动关联 |
+| 1 | 远端仓库可见、4 个提交与分支可 push、PR 可创建并关联 Issue | 半自动 | push 与 PR 创建是一次性人工动作（本次交付已做）；**PR 标题 QM-00x: xxx 约定** job 自动守住标题约定，标题带编号 Issue 才会自动关联 |
 | 2 | ubuntu 上 `cargo test --workspace` 全绿 + docker-compose 构建并健康检查通过 | 自动 | `rust-msrv` 步骤 3 + `compose-legacy` 步骤 6/7/8 |
-| 3 | windows-latest 上 `cargo test -p qm-media --features webrtc` 通过 | 自动 | `windows-webrtc`（先断言 `cl.exe` 存在，避免「静默跳过」假绿） |
+| 3 | windows-latest 上 `cargo test -p qm-media --features webrtc` 通过 | 自动 | **windows-latest / MSVC / qm-media --features webrtc**（先断言 `cl.exe` 存在，避免「静默跳过」假绿） |
 | 4 | 每个 QM 验收项能指到 CI job 或本地命令 | 自动 | 就是本文档第 2 节 |
 | 5 | 单次 CI 运行 ≤15 分钟 | 自动 | 每个 job 的 `timeout-minutes`；实际耗时看 run 详情（首次冷缓存可能接近上限） |
 
@@ -133,7 +141,7 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
 
 ## 3. 本表自身的维护约定
 
-1. 新增或修改 `QM-0xx` 的验收标准时，**同一个 PR 内**更新本表，否则 `pr-title` 之外的
+1. 新增或修改 `QM-0xx` 的验收标准时，**同一个 PR 内**更新本表，否则 **PR 标题 QM-00x: xxx 约定** 之外的
    review 环节会打回（文档滞后与代码不一致是 Epic 明确禁止项）。
 2. 把某项从「未覆盖」升级到「自动」时，要同时给出能挡住回归的失败条件
    （例如「重启次数 >6 判失败」），不要只写「跑了 xxx」。
@@ -142,10 +150,15 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
 
 ## 4. 已知缺口（本次交付未覆盖）
 
-- **分支保护未开启**：`.github` 下的配置需要仓库 admin 权限。请用
-  `gh api --method PUT /repos/yejinlei/QuickMeet/branches/main/protection` 开启，
-  或直接到 Settings → Branches 设置：要求 `rust-msrv`、`compose-legacy`、
-  `windows-webrtc` 三个 job 通过后才能合并。
+- **分支保护已开启**（`main` 分支，本次交付已 PUT）。注意 contexts 必须填
+  **check-run 显示名**而不是 job id —— 填成 job id（`rust-msrv` 等）时保护规则
+  对不存在的状态永远卡住、也永远放不了行。开启命令：
+  `gh api --method PUT repos/yejinlei/QuickMeet/branches/main/protection`（`-f` 会把 JSON
+  字符串化，用 `--input <file>`；`restrictions` 必须给，个人仓库传 `null`）。
+  当前 4 条 contexts：`ubuntu / Rust 1.75 / workspace 全绿`、
+  `ubuntu / docker-compose 1.29.2 / 容器健康检查`、
+  `windows-latest / MSVC / qm-media --features webrtc`、`PR 标题 QM-00x: xxx 约定`。
+  改 job `name` 之后 contexts 不会自动跟着变，必须重新 PUT。
 - **首次 CI 运行时长未经实测**：冷缓存下载 + Dockerfile 首次编译可能接近 15 分钟上限，
   第一次跑完后可把 `rust-cache` 的 key 收紧以稳定耗时。
 - **浏览器/端到端类验收（QM-001-2、QM-002 全部、QM-003-1 视觉项等）未覆盖**：
@@ -156,6 +169,7 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
   crate 挡到零 warning；workspace 全量的结果由 `rust-msrv` 步骤 2c 打印出来，
   不阻塞合并。清理完历史 warning 后把 `scripts/verify.sh` 步骤 2b 的
   `-p qm-common -p qm-cluster` 改成 `--workspace` 即可。
-- **`windows-webrtc` 的 MSVC 编译路径只有 CI 能验**：本机只有 MinGW 工具链，
+- **`windows-webrtc` job（显示名 windows-latest / MSVC / qm-media --features webrtc）的
+  MSVC 编译路径只有 CI 能验**：本机只有 MinGW 工具链，
   切到 `stable-x86_64-pc-windows-msvc` 时 proc-macro crate 的 host/target 不匹配
   （`cl.exe` 不在），所以这条验收在本地无法预演，首次结果要等 CI。
