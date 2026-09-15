@@ -10,6 +10,11 @@ repository.workspace = true
 
 [dependencies]
 qm-common = { path = "../qm-common" }
+# qm-cluster 只被建会议落点（`POST /room/{id}/place`）用到：信令是同步路由，
+# 集群是异步 NATS 客户端，两边靠一条超短超时通道衔接（见 `SignalRouter::place`）。
+# 依赖只增加编译产物里的函数，没有新增传递 crate（qm-cluster 的 hyper / http
+# 与信令完全同版本），锁文件无需变动。
+qm-cluster = { path = "../qm-cluster" }
 http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
