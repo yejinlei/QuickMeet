@@ -93,3 +93,11 @@ listener_capacity = 20000
 # 单条上行流按多少倍只收流观众折算媒体容量。
 # 旁听容量 = listener_fanout × listener_capacity = 200 × 20000 = 4,000,000 槽位。
 listener_fanout = 200
+
+# 节点健康探针端口（QM-018）：集群模式不监听 signaling_port，
+# docker healthcheck 没有 HTTP 端点可探，所以节点在 health_port 上另起一个
+# 只读 /healthz（GET 返回节点状态 JSON，POST 返回 202）。8090 刻意避开
+# 8080（媒体，全局约束）与 8081（信令）。
+# 写 0 会被 AppConfig::validate 拒绝 —— 探针是容器健康检查的唯一目标，
+# 没有「禁用探针」这个合法状态，否则 healthcheck 永远报 unhealthy。
+health_port = 8090

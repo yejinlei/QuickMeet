@@ -83,10 +83,17 @@ pub struct RoomState {
 ```
 load = rooms_ratio + listeners_ratio     # 各归一到 0..=1000，总和 0..=2000
 
-rooms_ratio     = rooms_on(node) * 1000 / max_rooms
-listeners_ratio = listeners_on(node) * 1000 / listener_weight
-listener_weight = listener_fanout * listener_capacity
+rooms_ratio     = rooms_on(node) * 1000 / node.max_rooms
+listeners_ratio = listeners_on(node) * 1000 / node.weight
+node.weight     = node.listener_fanout * node.listener_capacity
 ```
+
+`node.weight` 取的是**该节点自己随心跳上报的** `listener_fanout` /
+`listener_capacity`（`HeartbeatMsg` → `Node`），不是本节点本地的配置值。
+这是异构集群的前提：媒体节点和旁听节点配置不同时，用本地配置给远端节点计分
+会让所有节点权重相同，平局只能靠 `node_id` 字典序打破，可能把会议调度到
+不该承接媒体归属的节点上（`node_load_uses_the_node_own_capacity_not_local_config`
+与 `assign_picks_the_big_node_over_a_saturated_small_node` 两条单测钉死这个行为）。
 
 这样「很多小会议」和「很少但超大的旁听会议」能放在同一把尺子上比较 ——
 如果只数会议数，一个 10000 人旁听的大房间和一个空房间会被当成等重。
@@ -97,6 +104,15 @@ listener_weight = listener_fanout * listener_capacity
 
 调度请求走 NATS **队列订阅**：三个节点都订阅 `qm.<cid>.route.new` 但共享一个队列，
 NATS 只投递给队列里的一个节点，由它回包。请求方用 `request_timeout_secs` 兜底。
+
+房间快照走**广播**而不是请求/回复：每个节点 `initialize` 时先发布一次自己归属的
+房间，之后 `snapshot_publish_loop` 每 `heartbeat_secs` 重发一次
+（`qm.<cid>.room.snapshot`，载荷 `SnapshotPayload { total, rooms }`）。
+晚到的节点订阅完就能在**一个心跳周期内**收到全集群的房间视图 —— 这是验收标准 4
+（30s 内接入并开始承接新会议）的实现路径。快照是**追加式**的：`rooms` 只含发送方
+归属的房间，接收方按 `revision` 逐房间收敛，不按 `total` 反推删除（房间结束走
+`room.update` / `room.remove`）；`total` 是发送方看到的全集群房间数，用于判断这份
+快照是否覆盖了整个集群。
 
 ### 1.5 健康检查与故障迁移
 
@@ -307,8 +323,10 @@ docker-compose logs -f qm-media-4 | grep -E "调度|承接"
 
 **不需要重启任何现有节点。** 成员关系由心跳维护，新节点上线后其他节点
 在一个心跳窗口内就会看到它。验收标准 4 要求 30 秒内接入并开始承接新会议 ——
-默认配置下新节点连接 NATS、订阅 subject、拉到全量快照后立即可被调度，
-实际耗时通常远小于一个心跳周期。
+默认配置下新节点连接 NATS、订阅完 subject 之后，**下一个心跳周期**就会收到
+集群里各节点周期广播的房间快照（`snapshot_publish_loop`，每 `heartbeat_secs` 一次，
+`initialize` 时先发一次），房间视图随即对齐，之后即可被调度 —— 实际耗时远小于
+一个心跳周期（默认 5s），不需要任何请求/回复那种要求对端先在线的交互。
 
 ### 3.2 加一个旁听节点（放大旁听人数）
 
@@ -405,16 +423,16 @@ t≤10s    迁移完成，房间归属到负载最低的健康节点
 调度、健康判定、迁移目标选择都是纯函数，不需要 NATS 就能单测：
 
 ```bash
-cargo test -p qm-cluster          # 18 个单测：subject 规划、调度、判死、迁移目标、收敛、进程入口
+cargo test -p qm-cluster          # 34 个单测：subject 规划、调度、异构容量、判死、迁移目标、收敛、进程入口
 cargo test -p qm-common           # 28 个单测：含 cluster 配置校验与合规拒绝
-cargo test --workspace            # 全量 166 个测试
+cargo test --workspace            # 全量 182 个测试
 ```
 
 已覆盖的验收逻辑：
 
 | 验收标准 | 测试 |
 | --- | --- |
-| 1. 3 节点部署，会议分配到不同节点 | `assign_returns_none_when_no_candidates`、`cluster_defaults_satisfy_acceptance_windows` |
+| 1. 3 节点部署，会议分配到不同节点 | `assign_returns_none_when_no_candidates`、`assign_tie_break_is_deterministic`、`node_load_uses_the_node_own_capacity_not_local_config`、`assign_picks_the_big_node_over_a_saturated_small_node`（异构集群按节点自声明容量计分） |
 | 2. 节点宕机 10s 内迁移 | `cluster_defaults_satisfy_acceptance_windows`（判死窗口 = 5×2 = 10s） |
 | 3. ≥10000 人旁听容量 | `cluster_defaults_satisfy_acceptance_windows`（200×20000 = 400 万槽位） |
 | 4. 30s 内接入 | `cluster_defaults_satisfy_acceptance_windows`（join_target_secs = 30） |
@@ -482,7 +500,7 @@ NATS 是单点（无 JetStream 持久化）。宕机期间：
    CPU / 带宽，建议在真实 10000 人旁听场景中校准该系数。
 5. **本开发机没有 `nats-server` 也没有 Docker，无法在本地跑通 3 节点集成测试，
    也无法验证 docker-compose 1.29.2 的运行时行为。** 调度/健康/迁移逻辑
-   已用纯函数单测覆盖（`cargo test --workspace` 166 个测试全绿），
+   已用纯函数单测覆盖（`cargo test --workspace` 182 个测试全绿），
    但以下三项**必须**在部署环境实测，本 Issue 无法自证：
    * 验收标准 1 的多节点分配（§3.1）；
    * 验收标准 2 的 10s 内迁移（§3.5 故障演练）；
