@@ -21,3 +21,22 @@ tracing = { workspace = true }
 # 这样 cargo test 可以离线断言路由逻辑。默认开启 http 特性以提供可运行服务。
 hyper = { workspace = true }
 tokio = { workspace = true }
+
+# --- WebSocket 信令 / JWT / WSS（QM-004）---
+# tokio-tungstenite 只被 server.rs 用到，协议分发核心（WsRouter::dispatch）
+# 不依赖它，单测可以离线断言。
+tokio-tungstenite = { workspace = true }
+jsonwebtoken = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+
+[features]
+default = []
+# 开发用：允许在非 TLS / 测试环境注入开发签名密钥，便于本地联调（仅本地使用）。
+dev-sign = []

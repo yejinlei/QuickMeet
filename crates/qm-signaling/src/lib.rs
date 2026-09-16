@@ -13,6 +13,11 @@
 //! * `POST /room/{id}/candidate`     → 投递 ICE candidate
 //! * `POST /room/{id}/leave`         → 离开房间
 //!
+//! 房间与预约（QM-005，合并原 YEJ-111）见 [`rooms`]：房间生命周期 / 会议密码 /
+//! 等候室 / 主持人权限 / 参会者状态同步 / 空房 5 分钟宽限回收 / 会议预约与提醒。
+//! 路由面是 `/rooms/...`（复数），与上面的 `/room/{id}/...`（单数，SDP 转发面）
+//! 分工明确，互不影响。
+//!
 //! 关键约束的落点：
 //! * **Epic 约束 3（内网 192.168.0.0/24）** —— 每个信令请求的 `peer` 地址都必须
 //!   落在配置的私有网段内（[`Error::ensure_private_host`]），否则拒绝；
@@ -22,6 +27,11 @@
 //!
 //! hyper / tokio 只被 [`SignalHttp`] / [`start`] 用到；路由核心（[`SignalRouter::route`]）
 //! 不触碰它们，因此单测可以完全离线断言路由逻辑。
+
+pub mod auth;
+pub mod ice_gateway;
+pub mod rooms;
+pub mod ws;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -35,8 +45,25 @@ use qm_common::error::Result as QmResult;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// HTTP 方法字面量：路由匹配用字符串比较，避免在热路径上克隆 [`Method`]。
+const M_GET: &str = "GET";
+const M_POST: &str = "POST";
+const M_PATCH: &str = "PATCH";
+
 /// 信令服务默认端口（媒体端口 8080，信令错开一位）。
 pub const DEFAULT_SIGNALING_PORT: u16 = 8081;
+
+/// ICE 网关端口 = 信令端口 + 2（与信令 8081、媒体 8080 错开）。
+pub const ICE_GATEWAY_OFFSET: u16 = 2;
+
+/// ICE 网关完整地址（供验收报告与脚本引用）。
+pub fn ice_gateway_url(cfg: &qm_common::AppConfig) -> String {
+    format!(
+        "http://{}:{}",
+        cfg.network.bind_host,
+        cfg.media.signaling_port.saturating_add(ICE_GATEWAY_OFFSET)
+    )
+}
 
 /// 一个已加入房间的 peer。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,14 +95,18 @@ struct State {
 pub struct SignalRouter {
     cfg: Arc<qm_common::AppConfig>,
     state: Arc<Mutex<State>>,
+    /// 房间 / 预约状态机（QM-005）。SDP 转发状态仍在 `state` 里。
+    pub room: rooms::RoomManager,
 }
 
 impl SignalRouter {
     /// 按配置构造路由器。
     pub fn new(cfg: Arc<qm_common::AppConfig>) -> Self {
+        let room = rooms::RoomManager::new(cfg.clone());
         Self {
             cfg,
             state: Arc::new(Mutex::new(State::default())),
+            room,
         }
     }
 
@@ -132,8 +163,17 @@ impl SignalRouter {
 
         let method_display = method.to_string();
         let mut parts = path.split('/').filter(|s| !s.is_empty());
-        if parts.next() != Some("room") {
-            return json_err(StatusCode::NOT_FOUND, format!("未知路径：{path}"));
+        match parts.next() {
+            // `/rooms/...`：房间与预约管理面（QM-005），由 [`rooms::RoomManager`] 承接。
+            Some("rooms") => {
+                let a = parts.next().unwrap_or("").to_string();
+                let b = parts.next().unwrap_or("").to_string();
+                let c = parts.next().unwrap_or("").to_string();
+                return self.room_route(&method, &method_display, body, &a, &b, &c);
+            }
+            // `/room/{id}/...`：SDP / candidate 转发面（QM-001）。
+            Some("room") => {}
+            _ => return json_err(StatusCode::NOT_FOUND, format!("未知路径：{path}")),
         }
         let room = parts.next().unwrap_or("").to_string();
         let tail = parts.next().unwrap_or("").to_string();
@@ -255,6 +295,247 @@ fn json_err(status: StatusCode, message: impl Into<String>) -> Response<String> 
             .unwrap(),
         )
         .unwrap()
+}
+
+// ---- `/rooms/...` 房间管理面（QM-005） ----
+
+/// 把 [`rooms::RResult`] 转成 HTTP 响应：错误码映射 + 审计日志。
+fn r<T: Serialize>(res: rooms::RResult<T>) -> Response<String> {
+    match res {
+        Ok(v) => json_ok(&v),
+        Err(e) => {
+            tracing::warn!(room_error = %e, "房间操作失败");
+            json_err(
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+        }
+    }
+}
+
+/// 统一的 400 响应，供解析失败等前置校验使用。
+fn bad(msg: impl Into<String>) -> Response<String> {
+    json_err(StatusCode::BAD_REQUEST, msg)
+}
+
+/// 通用请求体解析 + 业务调用：解析失败一律 400。
+fn req_body<T, R: serde::Serialize>(
+    bytes: &[u8],
+    f: impl FnOnce(&T) -> rooms::RResult<R>,
+) -> Response<String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    match serde_json::from_slice::<T>(bytes) {
+        Ok(v) => r(f(&v)),
+        Err(e) => bad(format!("请求体解析失败：{e}")),
+    }
+}
+
+/// 从原始 JSON 装配 [`rooms::PeerRef`];字段缺失或解析失败按空身份处理（会被 403 拒）。
+/// `password` 是顶层密码兜底（`peer_ref` 里未带时用它）。
+fn ref_of(body: &[u8], password: Option<&str>) -> rooms::PeerRef {
+    let mut r: rooms::PeerRef = serde_json::from_slice(body).unwrap_or_default();
+    if r.password.is_none() {
+        r.password = password.map(str::to_string);
+    }
+    r
+}
+
+/// `POST /rooms/join/{id}` 请求体：`peer_ref` / `peer` / 顶层 `id` 三种写法都接受。
+#[derive(Debug, Deserialize, Default)]
+struct RoomJoinBody {
+    #[serde(default)]
+    pub peer_ref: rooms::PeerRef,
+    #[serde(default)]
+    pub peer: rooms::PeerRef,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl RoomJoinBody {
+    /// 合并 `peer_ref` / `peer` / 顶层 id 三处的参会者身份，密码以顶层为准。
+    fn actor(&self) -> rooms::PeerRef {
+        ref_of_identity(&self.peer_ref, &self.peer, self.id.as_deref(), self.password.as_deref())
+    }
+}
+
+/// `POST /rooms/media/{id}` 请求体：三态可选，只更新出现的字段。
+#[derive(Debug, Deserialize, Default)]
+struct MediaBody {
+    #[serde(default)]
+    pub peer_ref: rooms::PeerRef,
+    #[serde(default)]
+    pub peer: rooms::PeerRef,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub mic: Option<bool>,
+    #[serde(default)]
+    pub cam: Option<bool>,
+    #[serde(default)]
+    pub screen_share: Option<bool>,
+}
+
+impl MediaBody {
+    fn actor(&self) -> rooms::PeerRef {
+        ref_of_identity(&self.peer_ref, &self.peer, self.id.as_deref(), None)
+    }
+}
+
+/// `POST /rooms/cohost/{peer}` 请求体：操作者身份（目标角色固定 CoHost）。
+#[derive(Debug, Deserialize, Default)]
+struct RoleBody {
+    #[serde(default)]
+    pub peer_ref: rooms::PeerRef,
+    #[serde(default)]
+    pub peer: rooms::PeerRef,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl RoleBody {
+    fn actor(&self) -> rooms::PeerRef {
+        ref_of_identity(&self.peer_ref, &self.peer, self.id.as_deref(), self.password.as_deref())
+    }
+}
+
+/// `POST /rooms/mute/{peer}` 请求体：单人静音开关。
+#[derive(Debug, Deserialize, Default)]
+struct MuteBody {
+    #[serde(default)]
+    pub peer_ref: rooms::PeerRef,
+    #[serde(default)]
+    pub peer: rooms::PeerRef,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub mute: bool,
+}
+
+impl MuteBody {
+    fn actor(&self) -> rooms::PeerRef {
+        ref_of_identity(&self.peer_ref, &self.peer, self.id.as_deref(), self.password.as_deref())
+    }
+}
+
+/// 合并两处 `PeerRef` 与可选顶层 id：优先 `primary`，其次 `fallback`，最后 `id`。
+fn ref_of_identity(
+    primary: &rooms::PeerRef,
+    fallback: &rooms::PeerRef,
+    id: Option<&str>,
+    password: Option<&str>,
+) -> rooms::PeerRef {
+    let mut a = primary.clone();
+    if a.id.is_empty() {
+        a = fallback.clone();
+    }
+    if a.id.is_empty() {
+        a.id = id.unwrap_or_default().to_string();
+    }
+    if a.password.is_none() {
+        a.password = password.map(str::to_string);
+    }
+    a
+}
+
+/// `POST /rooms/cancel/appt/{id}` 请求体。
+#[derive(Debug, Deserialize, Default)]
+struct CancelBody {
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// `POST /rooms/tick/{now|reap}` 请求体：显式注入时间戳，便于离线复现调度。
+#[derive(Debug, Deserialize)]
+struct TickBody {
+    pub at: i64,
+}
+
+impl SignalRouter {
+    /// `/rooms/...` 路由表。`a` / `b` / `c` 是路径剩余三段，逐条按
+    /// `(方法, 动作, 位置 b, 位置 c)` 匹配；查不到即 404。
+    fn room_route(
+        &self,
+        method: &Method,
+        method_display: &str,
+        body: &[u8],
+        a: &str,
+        b: &str,
+        c: &str,
+    ) -> Response<String> {
+        let m = method.as_str();
+        match (m, a, b, c) {
+            (M_GET, "list", "", "") => json_ok(&self.room.rooms()),
+            (M_GET, "view", "rooms", "") => json_ok(&self.room.rooms()),
+            (M_GET, "events", room, "") => r(self.room.events_of(room)),
+            (M_GET, "waitlist", room, "") => r(self.room.waitlist_of(room)),
+            (M_GET, "peers", room, "") => r(self.room.peers_of(room)),
+            (M_POST, "create", "", "") => {
+                req_body(body, |b: &rooms::CreateRoom| self.room.create_room(b))
+            }
+            (M_POST, "join", room, "") => match serde_json::from_slice::<RoomJoinBody>(body) {
+                Ok(b) => r(self.room.join(room, &b.actor())),
+                Err(e) => bad(format!("请求体解析失败：{e}")),
+            }
+            (M_POST, "leave", room, "") => r(self.room.leave(room, &ref_of(body, None))),
+            (M_POST, "destroy", room, "") => {
+                r(self.room.destroy_room(room, &ref_of(body, None)))
+            }
+            // 注意顺序：`peer == ""` 表示**全局静音**，必须先于通配的 `peer` 匹配。
+            (M_POST, "mute", room, "") => r(self.room.mute_all(room, &ref_of(body, None))),
+            (M_POST, "mute", room, peer) => match serde_json::from_slice::<MuteBody>(body) {
+                Ok(b) => r(self.room.mute_peer(room, &b.actor(), peer, b.mute)),
+                Err(e) => bad(format!("请求体解析失败：{e}")),
+            }
+            (M_POST, "approve", room, peer) => {
+                r(self.room.approve_peer(room, &ref_of(body, None), peer))
+            }
+            (M_POST, "deny", room, peer) => r(self.room.deny_peer(room, &ref_of(body, None), peer)),
+            (M_POST, "kick", room, peer) => r(self.room.kick_peer(room, &ref_of(body, None), peer)),
+            (M_POST, "cohost", room, peer) => match serde_json::from_slice::<RoleBody>(body) {
+                Ok(b) => r(self.room.set_role(
+                    room,
+                    &b.actor(),
+                    peer,
+                    rooms::Role::CoHost,
+                )),
+                Err(e) => bad(format!("请求体解析失败：{e}")),
+            }
+            (M_POST, "media", room, "") => req_body(body, |b: &MediaBody| {
+                self.room.set_media(room, &b.actor(), b.mic, b.cam, b.screen_share)
+            }),
+            (M_POST, "tick", "now", "") => req_body(body, |b: &TickBody| {
+                Ok(self.room.tick_at(b.at))
+            }),
+            (M_POST, "tick", "reap", "") => req_body(body, |b: &TickBody| {
+                Ok(self.room.reap_expired_at(b.at))
+            }),
+            (M_POST, "appts", "", "") => req_body(body, |b: &rooms::ApptReq| {
+                self.room.create_appt(b)
+            }),
+            (M_GET, "appts", "", "") => json_ok(&self.room.list_appts(None, None)),
+            (M_GET, "appts", "room", room) => json_ok(&self.room.appts_of_room(room)),
+            (M_GET, "appt", id, "") => r(self.room.appt(id)),
+            (M_PATCH, "appt", id, "") => {
+                req_body(body, |b: &rooms::ApptPatch| self.room.update_appt(id, b))
+            }
+            (M_POST, "cancel", "appt", id) => req_body(body, |b: &CancelBody| {
+                self.room.cancel_appt(id, &b.reason)
+            }),
+            (M_GET, "facts", "", "") => json_ok(&self.room.memory_facts()),
+            _ => json_err(
+                StatusCode::NOT_FOUND,
+                format!("不支持的房间路由：{method_display} /rooms/{a}/{b}/{c}"),
+            ),
+        }
+    }
 }
 
 impl SignalRouter {
@@ -470,6 +751,7 @@ pub async fn start(cfg: Arc<qm_common::AppConfig>) -> QmResult<()> {
     );
     let router = SignalRouter::new(cfg.clone());
     tracing::info!(%host, %port, "信令服务启动（仅监听内网地址）");
+    scheduler_task(router.clone());
     let server = hyper::Server::bind(&addr).serve(hyper::service::make_service_fn(move |_| {
         let router = router.clone();
         async move {
@@ -483,6 +765,39 @@ pub async fn start(cfg: Arc<qm_common::AppConfig>) -> QmResult<()> {
         _ = tokio::signal::ctrl_c() => { tracing::info!("收到 Ctrl+C，信令服务退出"); }
     }
     Ok(())
+}
+
+/// 房间调度循环：等候室超时、会前提醒、定时建室 / 销毁、空房宽限回收。
+///
+/// 单线程 `tick`，30s 一次；只在真正产生变更时打一条汇总日志，避免日志噪音。
+/// 不在 tokio 运行时里（例如单测直接构造 [`SignalRouter`]）就跳过，不影响其他功能。
+fn scheduler_task(router: SignalRouter) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let rep = router.room.tick_at(rooms::now_unix());
+                    let changed = !rep.reminders.is_empty()
+                        || !rep.rooms_created.is_empty()
+                        || !rep.rooms_destroyed.is_empty()
+                        || !rep.rooms_reclaimed.is_empty();
+                    if changed {
+                        tracing::info!(
+                            created = rep.rooms_created.len(),
+                            destroyed = rep.rooms_destroyed.len(),
+                            reclaimed = rep.rooms_reclaimed.len(),
+                            reminders = rep.reminders.len(),
+                            "房间调度循环"
+                        );
+                    }
+                }
+            });
+        }
+        Err(_) => tracing::warn!("不在 tokio 运行时里，跳过房间调度任务"),
+    }
 }
 
 #[cfg(test)]

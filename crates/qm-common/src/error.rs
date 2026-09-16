@@ -23,6 +23,8 @@ pub enum ErrorKind {
     Ai,
     /// 集群（NATS 状态同步 / 路由 / 健康检查）错误。
     Cluster,
+    /// 身份鉴权（JWT 校验 / WSS 强制）失败。
+    Auth,
 }
 
 /// QuickMeet 统一错误类型。
@@ -54,6 +56,9 @@ pub enum Error {
     #[error("集群错误: {0}")]
     Cluster(String),
 
+    #[error("鉴权错误: {0}")]
+    Auth(String),
+
     #[error("非法输入: {0}")]
     InvalidArgument(String),
 
@@ -77,6 +82,7 @@ impl Error {
             Error::Codec { .. } => ErrorKind::Codec,
             Error::Storage(_) => ErrorKind::Storage,
             Error::Cluster(_) => ErrorKind::Cluster,
+            Error::Auth(_) => ErrorKind::Auth,
             Error::Ai(_) => ErrorKind::Ai,
             Error::InvalidArgument(_) => ErrorKind::InvalidArgument,
             Error::Internal(_) => ErrorKind::Internal,
@@ -114,6 +120,11 @@ impl Error {
     /// 集群（NATS 状态同步 / 路由 / 健康检查）错误。
     pub fn cluster(message: impl Into<String>) -> Self {
         Self::Cluster(message.into())
+    }
+
+    /// 身份鉴权（JWT 校验 / WSS 强制）错误。
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self::Auth(message.into())
     }
 
     /// 信令层错误（SDP / ICE candidate 转发与准入）。

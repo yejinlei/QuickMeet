@@ -8,7 +8,9 @@ pub mod error;
 pub mod logging;
 pub mod storage;
 
-pub use config::{AppConfig, ClusterConfig, ConfigSource, NodeRole};
+pub use config::{
+    AppConfig, AuthConfig, ClusterConfig, ConfigSource, NodeRole, RoomConfig, TlsConfig,
+};
 pub use error::{Cidr, Error, ErrorKind, Result};
 
 /// 运行时版本与约束快照，便于在日志与验收记录中固化构建参数。

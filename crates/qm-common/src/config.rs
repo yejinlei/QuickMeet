@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub ai: AiConfig,
     pub cluster: ClusterConfig,
+    pub auth: AuthConfig,
+    pub room: RoomConfig,
 }
 
 impl Default for AppConfig {
@@ -33,6 +35,54 @@ impl Default for AppConfig {
             storage: StorageConfig::default(),
             ai: AiConfig::default(),
             cluster: ClusterConfig::default(),
+            auth: AuthConfig::default(),
+            room: RoomConfig::default(),
+        }
+    }
+}
+
+/// 会议房间配置（QM-005：房间生命周期与权限管控）。
+///
+/// 所有字段都有默认值，且都落在 Issue 约定的硬约束上：
+/// 空房回收宽限期 300s（验收标准 4「最后一人离开 5 分钟自动释放」）。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct RoomConfig {
+    /// 所有人离开后的资源回收宽限期（秒）。到期整体释放房间对象 / 成员表 / 事件队列。
+    pub grace_secs: u64,
+    /// 单房间事件队列上限（环形截断，防无限增长）。
+    pub max_events: usize,
+    /// 参会人数上限的默认值（创建房间时未显式指定则用它；0 表示不限制）。
+    pub default_max_participants: usize,
+    /// 等候室默认开关。开启后非主持人成员进入后先停留在等候室，需主持人批准。
+    pub default_waiting_room: bool,
+    /// 主持人批准 / 拒绝等候室请求的超时时间（秒），超时按拒绝处理。
+    pub approval_timeout_secs: u64,
+    /// 会议预约的会前提醒时机（分钟前）。0 表示不发提醒（Issue YEJ-111：时机可配置）。
+    pub appt_reminder_mins: u64,
+    /// 预约开始前多少秒自动创建房间。0 表示正好在开始时刻创建。
+    pub appt_auto_create_lead_secs: u64,
+    /// 通知通道开关（Issue YEJ-111：站内信 + 桌面/移动通知）。
+    /// 三条通道都只面向内网，不做公网推送。
+    pub notify_in_app: bool,
+    pub notify_desktop: bool,
+    pub notify_mobile: bool,
+}
+
+impl Default for RoomConfig {
+    fn default() -> Self {
+        Self {
+            // Issue QM-005 验收标准 4：最后一人离开后 5 分钟释放。
+            grace_secs: 300,
+            max_events: 256,
+            default_max_participants: 64,
+            default_waiting_room: false,
+            approval_timeout_secs: 60,
+            appt_reminder_mins: 15,
+            appt_auto_create_lead_secs: 60,
+            notify_in_app: true,
+            notify_desktop: true,
+            notify_mobile: true,
         }
     }
 }
@@ -153,6 +203,122 @@ impl Default for AiConfig {
             enabled: false,
             base_url: "http://127.0.0.1:3000/v1".to_string(),
             timeout_ms: 30_000,
+        }
+    }
+}
+
+/// 参会者身份鉴权配置（QM-004）。
+///
+/// 强制约束：未携带有效 JWT 的信令连接**直接拒绝**，且在任何认证之前
+/// 一律不得返回会议信息。`enabled = false` 是给本地联调（浏览器页面 / demo）
+/// 留的逃生口，私有化交付时必须打开；关闭时在服务端日志里打 WARN 提示。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// 是否开启 JWT 强制鉴权。生产必须为 `true`。
+    pub enabled: bool,
+    /// HS256 对称密钥。**空字符串视为未配置**：一旦 `enabled = true` 而
+    /// 密钥为空，服务拒绝启动，避免"以为开了鉴权其实没开"。
+    /// 长度 ≥ 32 字节，否则拒绝启动（防短密钥暴力破解）。
+    pub jwt_secret: String,
+    /// 签名算法。本期只实现 HS256（本地对称密钥），其余值拒绝启动 ——
+    /// RS256 / 外部 IdP 归入 SSO/OAuth 预留入口，不在本期范围。
+    pub jwt_algorithm: String,
+    /// Token 有效期（秒）。默认 24 小时，参会者长会议不会被中途踢下线。
+    pub jwt_exp_secs: u64,
+    /// 允许的时钟偏移（秒）。NTP 不干净的私有化现场常见几分钟漂移，
+    /// 留 60 秒窗口，超过则按过期处理。
+    pub jwt_clock_skew_secs: u64,
+    /// 校验 token 里的 `exp` 声明。设为 `false` 时 token 永不过期 ——
+    /// 只做签发侧的演示，验收时应当为 `true`。
+    pub jwt_verify_exp: bool,
+    /// 允许的 `iss` 声明。为空则不校验签发方（本地自签 token）。
+    pub jwt_issuer: String,
+    /// 允许的 `aud` 声明。为空则不校验受众。
+    pub jwt_audience: String,
+    /// `sub` 必须包含的域后缀（如 `corp.example`）。为空则不校验。
+    /// SSO/OAuth 预留入口：IdP 侧把用户映射到 `sub`，这里做域级准入。
+    pub jwt_required_domain: String,
+    /// WSS（信令 WebSocket 的 TLS）配置。
+    pub tls: TlsConfig,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jwt_secret: String::new(),
+            jwt_algorithm: "HS256".to_string(),
+            jwt_exp_secs: 86_400,
+            jwt_clock_skew_secs: 60,
+            jwt_verify_exp: true,
+            jwt_issuer: String::new(),
+            jwt_audience: String::new(),
+            jwt_required_domain: String::new(),
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// 是否要求客户端走 WSS。`tls.enabled` 为 `false` 时服务端拒绝启动
+    /// 信令服务（QM-004 强制约束：信令通道强制 WSS，禁止明文传输）。
+    pub fn wss_required(&self) -> bool {
+        self.tls.enabled
+    }
+
+    /// JWT 鉴权是否生效：总开关打开**且**密钥已配置。
+    ///
+    /// 两者必须同时满足才算"真的在鉴权" —— `enabled = true` 而密钥为空是
+    /// 最典型的"以为开了其实没开"。[`AppConfig::validate`] 会直接拦住后者。
+    pub fn jwt_active(&self) -> bool {
+        self.enabled && !self.jwt_secret.trim().is_empty()
+    }
+}
+
+/// WSS / TLS 配置（QM-004 强制约束：信令通道强制 WSS 加密）。
+///
+/// 证书来源三选一（互斥，按 `cert_file` > `cert_pem` > 自动自签 的优先级）：
+/// * `cert_file` + `key_file`：私有化现场签发好的证书（推荐）。
+/// * `cert_pem`：直接把 PEM 文本写进配置（调试用）。
+/// * 都为空：启动时**自动生成**一张 90 天有效期的自签证书，SAN 含
+///   `localhost` / `127.0.0.1` / `0.0.0.0`，方便本机联调 —— 私有化交付
+///   时应当换成受信任 CA 签发的证书。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// 是否启用 TLS（即 WSS）。服务启动时强制校验为 `true`。
+    pub enabled: bool,
+    /// 证书文件路径（PEM）。
+    pub cert_file: String,
+    /// 私钥文件路径（PEM / PKCS8 / RSA）。
+    pub key_file: String,
+    /// 内联证书 PEM 文本（与 `cert_file` 二选一）。
+    pub cert_pem: String,
+    /// 内联私钥 PEM 文本（与 `key_file` 二选一）。
+    pub key_pem: String,
+    /// 自签证书的 CN（仅 `cert_file` / `cert_pem` 都为空时生效）。
+    pub self_signed_cn: String,
+    /// 自签证书有效期（天）。
+    pub self_signed_days: u32,
+    /// 绑定 TLS 监听的地址（默认与 `network.bind_host` 相同）。
+    pub bind_host: String,
+    /// 最小 TLS 版本。`1.2` 或 `1.3`，其他值拒绝启动。
+    pub min_tls_version: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_file: String::new(),
+            key_file: String::new(),
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            self_signed_cn: "QuickMeet Signaling".to_string(),
+            self_signed_days: 90,
+            bind_host: String::new(),
+            min_tls_version: "1.2".to_string(),
         }
     }
 }
@@ -439,6 +605,98 @@ impl AppConfig {
         }
         let cidrs = self.network.parsed_cidrs()?;
         self.cluster.validate(&cidrs)?;
+        self.auth.validate()?;
+        // 房间层（QM-005）：宽限期写 0 等于「空房立即回收」，会让重连的参会者直接掉线，
+        // 与验收标准 4（5 分钟宽限后释放）语义相反，所以在配置层挡住。
+        if self.room.grace_secs == 0 {
+            return Err(Error::config(
+                "room.grace_secs 不能为 0（空房回收需要宽限期判定，Issue QM-005 约定 300s）",
+            ));
+        }
+        if self.room.max_events == 0 {
+            return Err(Error::config("room.max_events 不能为 0"));
+        }
+        if self.room.default_max_participants > 512 {
+            return Err(Error::config(
+                "room.default_max_participants 不能超过 512（单房间调度上限）",
+            ));
+        }
+        if self.room.approval_timeout_secs == 0 {
+            return Err(Error::config(
+                "room.approval_timeout_secs 不能为 0（等候室批准必须有超时兜底）",
+            ));
+        }
+        // 预约层（YEJ-111）：提醒时机可配置，但不能配置成"永远提前"。
+        // 提前时间超过会议本身的时长时，提醒永远无法在会前触发，属于配置错误。
+        if self.room.appt_reminder_mins > 24 * 60 {
+            return Err(Error::config(
+                "room.appt_reminder_mins 不能超过 1440（24 小时，提前提醒窗口上限）",
+            ));
+        }
+        if self.room.appt_auto_create_lead_secs > 3600 {
+            return Err(Error::config(
+                "room.appt_auto_create_lead_secs 不能超过 3600（提前建房窗口上限 1 小时）",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AuthConfig {
+    /// 鉴权 / WSS 配置的内部一致性校验（QM-004）。
+    ///
+    /// `tls.enabled` 是否必须为 `true` 不放在这里 —— 媒体 / 集群服务不需要 WSS，
+    /// 那条强制约束由信令服务启动时把关（`cfg.auth.wss_required()`），否则
+    /// `tls.enabled = false` 会让整个 workspace 的配置校验都无法通过。
+    /// 这里校验的是"填了就必须填对"：
+    ///
+    /// * 证书 / 私钥来源必须成对；
+    /// * `min_tls_version` 只能是 1.2 / 1.3；
+    /// * `jwt_algorithm` 本期只认 HS256 —— RS256 / 外部 IdP 归入 SSO/OAuth
+    ///   预留入口，配了也跑不起来，因此拒绝启动；
+    /// * `enabled = true` 时密钥必须非空且 ≥ 32 字节，避免"以为开了其实没开"；
+    /// * `self_signed_days` 必须大于 0。
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(
+            self.tls.min_tls_version.as_str(),
+            "1.2" | "1.3" | "TLS1.2" | "TLS1.3"
+        ) {
+            return Err(Error::config(format!(
+                "auth.tls.min_tls_version 取值非法: {}（合法值：1.2 / 1.3）",
+                self.tls.min_tls_version
+            )));
+        }
+        // 证书 / 私钥来源必须成对：文件与内联文本要么都填要么都留空。
+        if self.tls.cert_file.trim().is_empty() != self.tls.key_file.trim().is_empty() {
+            return Err(Error::config(
+                "auth.tls.cert_file 与 auth.tls.key_file 必须成对填写（或都留空走自签证书）",
+            ));
+        }
+        if self.tls.cert_pem.trim().is_empty() != self.tls.key_pem.trim().is_empty() {
+            return Err(Error::config(
+                "auth.tls.cert_pem 与 auth.tls.key_pem 必须成对填写（或都留空走证书文件 / 自签）",
+            ));
+        }
+        if self.tls.self_signed_days == 0 {
+            return Err(Error::config("auth.tls.self_signed_days 必须大于 0"));
+        }
+        if self.enabled && self.jwt_secret.trim().is_empty() {
+            return Err(Error::config(
+                "auth.enabled = true 但 auth.jwt_secret 为空：JWT 鉴权无法工作，请配置密钥（≥32 字节）",
+            ));
+        }
+        if self.jwt_active() && self.jwt_secret.len() < 32 {
+            return Err(Error::config(format!(
+                "auth.jwt_secret 长度不足（{} 字节，至少 32）：短密钥会被暴力破解",
+                self.jwt_secret.len()
+            )));
+        }
+        if self.enabled && self.jwt_algorithm.trim().to_ascii_uppercase() != "HS256" {
+            return Err(Error::config(format!(
+                "auth.jwt_algorithm 不支持: {}（本期只实现 HS256；RS256 / 外部 IdP 走 SSO/OAuth 预留入口）",
+                self.jwt_algorithm
+            )));
+        }
         Ok(())
     }
 }
@@ -482,6 +740,22 @@ fn env_overrides_map() -> Result<serde_json::Map<String, serde_json::Value>> {
                 "环境变量 {k} 指向未知的配置项 {section}.{field}"
             )));
         }
+        // `QM_AUTH_TLS_ENABLED` -> `auth.tls.enabled`：TlsConfig 嵌在 auth 下，
+        // 环境变量只按第一个 `_` 分层，这里手动下钻一层。
+        if section == "auth" && field.starts_with("tls_") {
+            let inner = &field["tls_".len()..];
+            let tls = out
+                .entry("auth".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .expect("env_overrides_map 只写 Object 节点")
+                .entry("tls".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .expect("env_overrides_map 只写 Object 节点");
+            tls.insert(inner.to_string(), value_from_env(&v));
+            continue;
+        }
         out.entry(section.clone())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
             .as_object_mut()
@@ -504,6 +778,42 @@ fn known_section(section: &str, field: &str) -> bool {
             | ("storage", "data_dir" | "encrypted")
             | ("ai", "enabled" | "base_url" | "timeout_ms")
             | (
+                "auth",
+                "enabled"
+                    | "jwt_secret"
+                    | "jwt_algorithm"
+                    | "jwt_exp_secs"
+                    | "jwt_clock_skew_secs"
+                    | "jwt_verify_exp"
+                    | "jwt_issuer"
+                    | "jwt_audience"
+                    | "jwt_required_domain"
+            ) | (
+                "auth",
+                "tls_enabled"
+                    | "tls_cert_file"
+                    | "tls_key_file"
+                    | "tls_cert_pem"
+                    | "tls_key_pem"
+                    | "tls_self_signed_cn"
+                    | "tls_self_signed_days"
+                    | "tls_bind_host"
+                    | "tls_min_tls_version"
+            )
+            | (
+                "room",
+                "grace_secs"
+                    | "max_events"
+                    | "default_max_participants"
+                    | "default_waiting_room"
+                    | "approval_timeout_secs"
+                    | "appt_reminder_mins"
+                    | "appt_auto_create_lead_secs"
+                    | "notify_in_app"
+                    | "notify_desktop"
+                    | "notify_mobile"
+            )
+            | (
                 "cluster",
                 "server"
                     | "port"
@@ -523,10 +833,22 @@ fn known_section(section: &str, field: &str) -> bool {
     )
 }
 
-/// 尽力把环境变量字符串解析成 JSON 值：数组/对象/数字/布尔按其字面含义，
-/// 否则当作字符串。这样 `QM_NETWORK_CIDRS='["a","b"]'` 能落进 Vec 字段。
+/// 尽力把环境变量字符串解析成 JSON 值：数组/对象/整数/布尔按其字面含义，
+/// 其余一律当字符串。这样 `QM_NETWORK_CIDRS='["a","b"]'` 能落进 Vec 字段。
+///
+/// 特别注意**小数不能当数字**：`QM_AUTH_TLS_MIN_TLS_VERSION=1.3` 是 TLS 版本
+/// 字符串（`"1.3"`），不是浮点数；被解析成 `1.3` 之后 figment 反序列化到
+/// `String` 字段会静默失败，配置看起来生效其实没生效。
 fn value_from_env(v: &str) -> serde_json::Value {
-    serde_json::from_str(v).unwrap_or_else(|_| serde_json::Value::String(v.to_string()))
+    let parsed = serde_json::from_str::<serde_json::Value>(v);
+    if let Ok(serde_json::Value::Number(n)) = &parsed {
+        if n.is_i64() || n.is_u64() {
+            return parsed.unwrap();
+        }
+    } else if matches!(parsed.as_ref(), Ok(serde_json::Value::Bool(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_))) {
+        return parsed.unwrap();
+    }
+    serde_json::Value::String(v.to_string())
 }
 
 #[cfg(test)]
@@ -558,6 +880,91 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.network.cidrs.clear();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn auth_defaults_are_off_and_valid() {
+        // 默认关闭鉴权（本地联调逃生口），但配置本身必须合法 ——
+        // 强制 WSS 的把关在信令服务启动时，不在 config::validate。
+        let cfg = AppConfig::default();
+        assert!(!cfg.auth.jwt_active());
+        assert!(!cfg.auth.wss_required());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn auth_validate_rejects_enabled_without_secret() {
+        // 最典型的"以为开了其实没开"：开关打开但密钥是空的。
+        let mut cfg = AppConfig::default();
+        cfg.auth.enabled = true;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("jwt_secret"), "{err}");
+    }
+
+    #[test]
+    fn auth_validate_rejects_short_secret() {
+        let mut cfg = AppConfig::default();
+        cfg.auth.enabled = true;
+        cfg.auth.jwt_secret = "tooshort".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("长度不足"), "{err}");
+    }
+
+    #[test]
+    fn auth_accepts_a_long_secret_and_reports_active() {
+        let mut cfg = AppConfig::default();
+        cfg.auth.enabled = true;
+        cfg.auth.jwt_secret = "0123456789abcdef0123456789abcdef".to_string(); // 32 字节
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.auth.jwt_active());
+        assert!(cfg.auth.wss_required() == cfg.auth.tls.enabled);
+    }
+
+    #[test]
+    fn auth_validate_rejects_unsupported_algorithm() {
+        // 本期只实现 HS256；RS256 归 SSO/OAuth 预留入口，配了拒绝启动。
+        let mut cfg = AppConfig::default();
+        cfg.auth.enabled = true;
+        cfg.auth.jwt_secret = "0123456789abcdef0123456789abcdef".to_string();
+        cfg.auth.jwt_algorithm = "RS256".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("HS256"), "{err}");
+    }
+
+    #[test]
+    fn auth_validate_rejects_bad_tls_version_and_mismatched_certs() {
+        let mut cfg = AppConfig::default();
+        cfg.auth.tls.min_tls_version = "1.1".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("min_tls_version"), "{err}");
+
+        cfg.auth.tls.min_tls_version = "1.2".to_string();
+        cfg.auth.tls.cert_file = "cert.pem".to_string(); // 私钥缺失，不成对
+        assert!(cfg.validate().is_err());
+        cfg.auth.tls.cert_file.clear();
+        cfg.auth.tls.key_pem = "-----BEGIN PRIVATE KEY-----".to_string();
+        assert!(cfg.validate().is_err(), "内联私钥没有配套证书也必须拒绝");
+    }
+
+    #[test]
+    fn env_override_auth_tls_nested_into_auth_section() {
+        let _g = ENV_LOCK.lock();
+        std::env::set_var("QM_AUTH_TLS_ENABLED", "true");
+        std::env::set_var("QM_AUTH_TLS_MIN_TLS_VERSION", "1.3");
+        std::env::set_var("QM_AUTH_JWT_ALGORITHM", "HS256");
+        let out = env_overrides_map().unwrap();
+        std::env::remove_var("QM_AUTH_TLS_ENABLED");
+        std::env::remove_var("QM_AUTH_TLS_MIN_TLS_VERSION");
+        std::env::remove_var("QM_AUTH_JWT_ALGORITHM");
+
+        let auth = out.get("auth").unwrap().as_object().unwrap();
+        assert_eq!(
+            auth.get("jwt_algorithm").and_then(|v| v.as_str()),
+            Some("HS256")
+        );
+        let tls = auth.get("tls").unwrap().as_object().unwrap();
+        assert_eq!(tls.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(tls.get("min_tls_version").and_then(|v| v.as_str()), Some("1.3"));
     }
 
     #[test]

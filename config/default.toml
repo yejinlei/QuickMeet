@@ -93,3 +93,26 @@ listener_capacity = 20000
 # 单条上行流按多少倍只收流观众折算媒体容量。
 # 旁听容量 = listener_fanout × listener_capacity = 200 × 20000 = 4,000,000 槽位。
 listener_fanout = 200
+
+[room]
+# 会议房间管理（QM-005）：密码 / 人数上限 / 等候室 / 主持人权限 / 资源回收。
+#
+# grace_secs 是验收标准 4 的口径：所有人都离开后保留房间 5 分钟，
+# 到点整体释放房间对象、成员表与事件队列，不产生残留占用。
+grace_secs = 300
+# 单房间事件队列上限（环形截断）：超过就丢最旧的，保证内存有界。
+max_events = 256
+# 创建房间时未显式指定人数上限则用它；0 表示不限制。
+default_max_participants = 64
+# 等候室默认开关：开启后非主持人成员先进等候室，等主持人批准。
+default_waiting_room = false
+# 主持人审核超时（秒）：超时按拒绝处理，参会者不会永远卡在等候室。
+approval_timeout_secs = 60
+# 预约的会前提醒时机（分钟前）；0 = 不发提醒。
+appt_reminder_mins = 15
+# 预约开始前多少秒自动创建房间；0 = 正好在开始时刻创建。
+appt_auto_create_lead_secs = 60
+# 会前提醒通道开关：三条通道都只走内网，不做公网推送。
+notify_in_app = true
+notify_desktop = true
+notify_mobile = true
