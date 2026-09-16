@@ -19,6 +19,7 @@
 #   7. docker-compose config（含 compose 1.29.2 语法兼容校验）
 #   8. docker-compose up -d --build + 四容器 healthcheck 全部 healthy + /healthz 探活
 #   9. 逐个 restart 服务，验证 restart: unless-stopped 自愈
+#  10. CI workflow 语义校验（YEJ-114 并入 QM-015，见 scripts/verify-workflows.sh）
 
 set -uo pipefail
 
@@ -28,7 +29,9 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT" || exit 1
 
 NO_DOCKER=0
-SELECTED="${STEPS:-1 2 3 4 5 6 7 8 9}"
+SELECTED="${STEPS:-1 2 3 4 5 6 7 8 9 10}"
+# 读成数组，避免「步骤 10 被 SELECTED 里的 " 1 " 模式匹配误命中」。
+SELECTED_ARR=($SELECTED)
 case "${1:-}" in
   --no-docker) NO_DOCKER=1 ;;
   --help|-h) grep -E '^#|^[0-9]+\.' "$0" | head -40; exit 0 ;;
@@ -43,7 +46,7 @@ ok() { printf '   \033[32mPASS\033[0m %s\n' "$1"; PASS_COUNT=$((PASS_COUNT + 1))
 fail() { printf '   \033[31mFAIL\033[0m %s\n' "$1"; FAILURES+=("$1"); }
 skip() { printf '   \033[33mSKIP\033[0m %s\n' "$1"; }
 
-want() { case " $SELECTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+want() { for s in "${SELECTED_ARR[@]}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
 
 # 运行一条命令并记录 PASS/FAIL。
 step() {
@@ -229,6 +232,29 @@ if want 9; then
       [ "$st" = "healthy" ] || OK_ALL=0
     done
     [ "$OK_ALL" = 1 ] && ok "9. 重启自愈" || fail "9. 重启自愈"
+  fi
+fi
+
+# ── 10. CI workflow 语义校验（YEJ-114 并入 QM-015）───────────────
+#
+# 与 CI job `workflow-lint` 跑的是同一份脚本，本地过一遍就能提前发现
+# 「YAML 解析成功但语义已变」这类坑（on 被吞成 bool、job id 含点号、
+# name 被当成 inline mapping、uses: 没固定 ref 等）。
+# 不依赖 docker，所以 --no-docker 时也照跑。
+if want 10; then
+  say "10. CI workflow 语义校验（scripts/verify-workflows.sh）"
+  PY_BIN=""
+  for c in python3 python py; do
+    if have "$c"; then PY_BIN="$c"; break; fi
+  done
+  if [ -z "$PY_BIN" ]; then
+    skip "10. workflow 校验（缺少 python3 / python）"
+  elif ! "$PY_BIN" -c 'import yaml' >/dev/null 2>&1; then
+    skip "10. workflow 校验（缺少 pyyaml：$PY_BIN -m pip install pyyaml）"
+  else
+    export PYTHONIOENCODING=UTF-8 PYTHONUNBUFFERED=1
+    step "10. workflow 预检（含 7 个反例自证）" \
+      bash scripts/verify-workflows.sh
   fi
 fi
 
