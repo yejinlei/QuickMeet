@@ -93,18 +93,6 @@ pub struct WsReply {
 }
 
 impl WsReply {
-    fn ok_(action: &str) -> Self {
-        Self {
-            ok: true,
-            room: None,
-            to: None,
-            from: None,
-            type_: action.to_string(),
-            code: None,
-            error: None,
-        }
-    }
-
     fn fail(action: &str, code: &str, error: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -270,6 +258,9 @@ impl WsRoom {
 #[derive(Debug, Default)]
 pub struct WsState {
     rooms: HashMap<String, WsRoom>,
+    /// peer -> 握手阶段 JWT 校验出来的身份。传输层建连时写入，`join` 读取；
+    /// 鉴权关闭（本地联调逃生口）时缺省回落到 peer 名字，语义不变。
+    identities: HashMap<String, Identity>,
     /// 已转发的 SDP 总数。
     pub sdp_relayed: u64,
     /// 已转发的 ICE candidate 总数。
@@ -304,6 +295,26 @@ impl WsState {
     /// 每个房间的成员视图。
     pub fn room_peers(&self, room: &str) -> Vec<WsPeer> {
         self.rooms.get(room).map(|r| r.peers()).unwrap_or_default()
+    }
+
+    /// 房间当前成员数（不存在返回 0）。
+    pub fn room_size(&self, room: &str) -> usize {
+        self.rooms.get(room).map(|r| r.peers().len()).unwrap_or(0)
+    }
+
+    /// 记录握手阶段鉴权出来的身份（`peer` 在 `join` 前就绑定）。
+    pub fn set_identity(&mut self, peer: &str, identity: Identity) {
+        self.identities.insert(peer.to_string(), identity);
+    }
+
+    /// 取出并移除 `peer` 的身份（`join` 成功后写入成员表）。
+    pub fn take_identity(&mut self, peer: &str) -> Option<Identity> {
+        self.identities.remove(peer)
+    }
+
+    /// 移除整个房间（连接断开时该 peer 的所有连接都死了，成员不能挂在孤儿房间上）。
+    pub fn drop_room(&mut self, room: &str) -> bool {
+        self.rooms.remove(room).is_some()
     }
 }
 
@@ -396,10 +407,32 @@ impl WsRouter {
         }
         match t.as_str() {
             "join" => self.join(&req),
-            "offer" => self.sdp(&req, "offer"),
-            "answer" => self.sdp(&req, "answer"),
-            "candidate" | "ice" => self.ice(&req),
-            "leave" => self.leave(&req),
+            // 协议层的第二道闸：**非 `join` 动作**必须先加入房间才能发言，否则任何
+            // 知道 peer 字面量的人都能向房间里塞 SDP / candidate，等于把房间成员名
+            // 当成准入凭证。真正的身份边界在 WSS 握手的 JWT（[`crate::server`]）；
+            // 这里拦的是"已建连但还没 join 就发包"的时序与越权。`join` 本身必须
+            // 放行 —— 一个 peer 的第一条帧就是 join。
+            "offer" | "answer" | "candidate" | "ice" | "leave" => {
+                let peer = req.peer.trim();
+                if !self.is_room_member(&req.room, peer) {
+                    return WsResult::reply_only(WsReply::fail(
+                        &req.t,
+                        "UNAUTHORIZED",
+                        format!(
+                            "peer {peer} 未加入房间 {}（请先发送 t = \"join\"）",
+                            req.room
+                        ),
+                    ));
+                }
+                match t.as_str() {
+                    "offer" => self.sdp(&req, "offer"),
+                    "answer" => self.sdp(&req, "answer"),
+                    "candidate" | "ice" => self.ice(&req),
+                    _ => self.leave(&req),
+                }
+            }
+            // 未知动作不查成员表：一个根本没定义过的动作名不该拿到
+            // "你未加入房间"这种看起来像准入失败的答复，一律 BAD_REQUEST。
             other => WsResult::reply_only(WsReply::fail(
                 other,
                 "BAD_REQUEST",
@@ -414,15 +447,99 @@ impl WsRouter {
         self.state.lock().others(room, skip)
     }
 
+    /// `peer` 是否是 `room` 的成员。
+    ///
+    /// 传输层（[`crate::server`]）也用它：连接建立后才知道 peer 名，用它判断
+    /// 该 peer 是否还有别的房间在挂着连接。
+    pub fn is_room_member(&self, room: &str, peer: &str) -> bool {
+        self.state
+            .lock()
+            .room_peers(room)
+            .iter()
+            .any(|p| p.id == peer)
+    }
+
+    /// `peer` 所在的第一个房间（没有则 `None`）。用于连接断开时定位房间。
+    pub fn room_of(&self, peer: &str) -> Option<String> {
+        self.state
+            .lock()
+            .rooms
+            .iter()
+            .find(|(_, r)| r.peers().iter().any(|p| p.id == peer))
+            .map(|(k, _)| k.clone())
+    }
+
+    /// 房间当前成员数（成员上限门禁用）。
+    pub fn room_peer_count(&self, room: &str) -> usize {
+        self.state.lock().room_peers(room).len()
+    }
+
+    /// 记录握手阶段 JWT 校验出来的身份：连接建立时就绑定身份，`join` 时
+    /// 从这里取，不再信任帧里自填的 `peer`（后者只是房间内显示名）。
+    pub fn set_identity(&self, peer: &str, identity: Identity) {
+        self.state.lock().set_identity(peer, identity);
+    }
+
+    /// 从所有房间里移除 `peer`，返回被改动的房间（供 `peer_left` 广播）。
+    ///
+    /// 连接断开时调用：成员表里若不留痕迹，其他人会一直等它的 `peer_left`，
+    /// 表现为"人在但没声音"。
+    pub fn forget_peer(&self, peer: &str) -> Vec<String> {
+        let mut st = self.state.lock();
+        let mut touched = Vec::new();
+        for (room, r) in &mut st.rooms {
+            if r.remove(peer).is_some() {
+                touched.push(room.clone());
+            }
+        }
+        for room in &touched {
+            if st.rooms.get(room).map(WsRoom::is_empty).unwrap_or(false) {
+                st.rooms.remove(room);
+            }
+        }
+        touched
+    }
+
     fn join(&self, req: &WsRequest) -> WsResult {
-        let identity = Identity {
+        // 房间人数上限：广播开销与成员表内存都随房间规模线性增长，超限直接拒，
+        // 不排队不重试（客户端可换房间或联系主持人）。`0` = 不限制。
+        let cap = self.router.cfg.media.signaling_max_per_room;
+        if cap > 0 && self.room_peer_count(&req.room) >= cap {
+            return WsResult::reply_only(WsReply::fail(
+                &req.t,
+                "ROOM_FULL",
+                format!(
+                    "房间 {} 已达参会者上限 {}（可在 media.signaling_max_per_room 调整）",
+                    req.room, cap
+                ),
+            ));
+        }
+        // 内网准入（QM-004 前置约束）：公网 peer 不建立成员关系。不拦住的话，
+        // 公网地址会落进成员表，之后 SDP / candidate 的准入检查全部失效。
+        if let Err(e) = self.router.check_peer(req.peer.trim()) {
+            return WsResult::reply_only(WsReply::fail(
+                &req.t,
+                "FORBIDDEN",
+                e.to_string(),
+            ));
+        }
+        // 身份来自握手阶段（[`crate::server`] 校验 JWT 后写入 state），**不信任**
+        // 客户端在帧里自填的 `peer` —— 后者只是房间内的显示名。鉴权关闭时
+        // 这里回落到 peer 名，行为与旧客户端一致。
+        let mut st = self.state.lock();
+        let identity = st.take_identity(req.peer.trim()).unwrap_or_else(|| Identity {
             subject: req.peer.trim().to_string(),
             display: req.peer.trim().to_string(),
-        };
-        let mut st = self.state.lock();
+        });
+        // 重连递增 generation：旧连接的滞留消息用 generation 比对丢弃。
+        let generation = st
+            .room_mut(&req.room)
+            .get(req.peer.trim())
+            .map(|p| p.generation.saturating_add(1))
+            .unwrap_or(1);
         let was_new = st
             .room_mut(&req.room)
-            .insert(WsPeer::new(req.peer.trim().to_string(), identity, 1));
+            .insert(WsPeer::new(req.peer.trim().to_string(), identity, generation));
         if was_new {
             st.connections += 1;
         }
@@ -480,6 +597,15 @@ impl WsRouter {
             ));
         }
         if let Err(e) = self.router.check_peer(&req.peer) {
+            return WsResult::reply_only(WsReply::fail(
+                &req.t,
+                "FORBIDDEN",
+                e.to_string(),
+            ));
+        }
+        // 发送方与接收方都过准入：只查发送方的话，攻击者用合法内网 `peer`
+        // 就能把 SDP 塞到公网地址上，白名单等于只剩半张纸。
+        if let Err(e) = self.router.check_peer(target) {
             return WsResult::reply_only(WsReply::fail(
                 &req.t,
                 "FORBIDDEN",
@@ -591,6 +717,22 @@ impl WsRouter {
             ));
         }
 
+        // 准入与字段完整性同样先于暂存：不合法的 `to` 不该在协商完成后被回放出去。
+        if let Err(e) = self.router.check_peer(&req.peer) {
+            return WsResult::reply_only(WsReply::fail(
+                &req.t,
+                "FORBIDDEN",
+                e.to_string(),
+            ));
+        }
+        if let Err(e) = self.router.check_peer(target) {
+            return WsResult::reply_only(WsReply::fail(
+                &req.t,
+                "FORBIDDEN",
+                e.to_string(),
+            ));
+        }
+
         // 归一 + mDNS 还原 + 完整性校验（黑屏根因之一：缺 sdpMid / sdpMLineIndex
         // 的 candidate 无法挂载到 m-line，一律拒绝而不是猜）。
         let mut normalized = match crate::ice_gateway::normalize_candidate(&Value::String(candidate.to_string())) {
@@ -666,13 +808,6 @@ impl WsRouter {
                 &req.t,
                 "ICE_PENDING",
                 "协商尚未完成，candidate 已暂存，收到 SDP 后自动下发",
-            ));
-        }
-        if let Err(e) = self.router.check_peer(&req.peer) {
-            return WsResult::reply_only(WsReply::fail(
-                &req.t,
-                "FORBIDDEN",
-                e.to_string(),
             ));
         }
         let frame = json!({
@@ -832,10 +967,17 @@ mod tests {
     #[test]
     fn public_peer_sdp_is_forbidden() {
         let r = router();
+        // 公网地址先被内网准入拦下（join 阶段），已加入的公网 peer 再发 SDP
+        // 也会被 `check_peer` 二次拒绝 —— 两条路径都必须命中 FORBIDDEN。
+        let denied_join = send(&r, r#"{"t":"join","room":"m","peer":"8.8.8.8:1"}"#);
+        assert_eq!(denied_join.reply.unwrap().code.unwrap(), "FORBIDDEN");
+
         send(&r, r#"{"t":"join","room":"m","peer":"192.168.0.10:1"}"#);
+        // `sdp` 的准入顺序：SDP 字段完整性 → 内网准入。公网地址必须被
+        // 准入规则拦下，不能因为它恰好是房间成员就被放行。
         let resp = send(
             &r,
-            r#"{"t":"offer","room":"m","peer":"8.8.8.8:1","to":"192.168.0.10:1","sdp":"v=0"}"#,
+            r#"{"t":"offer","room":"m","peer":"192.168.0.10:1","to":"8.8.8.8:1","sdp":"v=0"}"#,
         );
         assert_eq!(resp.reply.unwrap().code.unwrap(), "FORBIDDEN");
     }

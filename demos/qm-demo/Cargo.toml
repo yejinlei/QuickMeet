@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 qm-common = { path = "../../crates/qm-common" }
-qm-media = { path = "../../crates/qm-media" }
+qm-media = { path = "../../crates/qm-media", features = ["webrtc"] }
 qm-signaling = { path = "../../crates/qm-signaling" }
 qm-cluster = { path = "../../crates/qm-cluster" }
 clap = { workspace = true }

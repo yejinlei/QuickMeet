@@ -16,8 +16,14 @@
 [media]
 # 媒体服务监听端口（全局约束：8080）
 port = 8080
-# 信令 HTTP 服务端口
+# 信令 HTTP 服务端口（REST 面：/room/{id}/...，兼容旧客户端）
 signaling_port = 8081
+# WebSocket 信令端口（QM-004，强制 WSS 面：wss://<host>:8082/）
+signaling_ws_port = 8082
+# 每个信令房间的参会者上限，0 表示不限制（建议保持 100 以内）
+signaling_max_per_room = 100
+# 单条信令帧字节上限（1 MiB），超过即断开该连接
+signaling_max_frame_bytes = 1048576
 # 单会议最大参与者数，0 表示不限制
 max_participants = 64
 # 会话空闲超时（秒），超时后关闭 PeerConnection 释放资源
@@ -52,6 +58,58 @@ enabled = false
 # 本地部署的硅基流动接口；必须是内网地址，禁止公网第三方 API
 base_url = "http://127.0.0.1:3000/v1"
 timeout_ms = 30000
+
+[auth]
+# WebSocket 信令鉴权与 WSS（QM-004）。
+#
+# 两条强制约束都在这里把关：
+#   * enabled = true  —— 未携带有效 JWT 的连接在握手阶段直接拒绝，拿不到任何会议信息；
+#   * tls.enabled = true —— 信令通道强制 WSS，禁止明文传输（服务端拒绝以 ws:// 明文启动）。
+#
+# 环境变量覆盖：QM_AUTH_JWT_SECRET、QM_AUTH_TLSCERT_FILE ...（只按第一个 _ 分层，
+# 见 config 加载注释）。
+
+# JWT 强制鉴权总开关。生产必须为 true。
+enabled = true
+# HS256 对称密钥（≥ 32 字节）。
+# ⚠️ 下面这个值**仅为内网联调**，真实部署必须换成现场生成的随机密钥：
+#     QM_AUTH_JWT_SECRET="$(openssl rand -base64 48)" docker compose up -d
+# 密钥为空且 enabled = true 会直接拒绝启动（防"以为开了其实没开"）。
+jwt_secret = "quickmeet-dev-signaling-secret-change-me-32b"
+# 签名算法。本期只实现 HS256；RS256 / 外部 IdP 走下方 SSO/OAuth 预留入口。
+jwt_algorithm = "HS256"
+# token 有效期（秒），默认 24 小时 —— 参会者长会议不会被中途踢下线。
+jwt_exp_secs = 86400
+# 允许的时钟偏移（秒）。私有化现场 NTP 不干净，留 60 秒窗口。
+jwt_clock_skew_secs = 60
+# 校验 exp 声明。设为 false 时 token 永不过期，仅用于签发侧演示。
+jwt_verify_exp = true
+# 允许的 iss 声明。留空则不校验签发方（本地自签）。
+jwt_issuer = ""
+# 允许的 aud 声明。留空则不校验受众。
+jwt_audience = ""
+# SSO/OAuth 预留入口：sub 必须包含的域后缀（如 "corp.example"）。留空则不校验。
+jwt_required_domain = ""
+
+[auth.tls]
+# WSS（信令 WebSocket 的 TLS）。服务启动时强制校验为 true。
+enabled = true
+# 证书文件路径（PEM）。与 key_file 成对填写；两者都留空则启动时自动生成
+# 一张 90 天有效期的自签证书（SAN 含 localhost / 127.0.0.1），浏览器会提示
+# 不受信任 —— 私有化交付时请替换为受信任 CA 签发的证书。
+cert_file = ""
+key_file = ""
+# 内联证书 / 私钥 PEM 文本（与 cert_file + key_file 二选一）。
+cert_pem = ""
+key_pem = ""
+# 自签证书的 CN（仅上面两组都留空时生效）。
+self_signed_cn = "QuickMeet Signaling"
+# 自签证书有效期（天）。
+self_signed_days = 90
+# 绑定 TLS 监听的地址。留空则使用 network.bind_host。
+bind_host = ""
+# 最小 TLS 版本。只接受 1.2 / 1.3，其他值拒绝启动。
+min_tls_version = "1.2"
 
 [cluster]
 # 分布式集群（QM-006）：NATS 房间状态同步 + 最低负载调度 + 健康检查与故障迁移。

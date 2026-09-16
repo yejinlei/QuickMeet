@@ -97,8 +97,24 @@ pub struct MediaConfig {
     pub max_participants: usize,
     /// 会话空闲超时（秒），超时后关闭 PeerConnection 释放资源。
     pub idle_timeout_secs: u64,
-    /// 信令 HTTP 服务端口。
+    /// 信令 HTTP 服务端口（兼容旧客户端的 REST 面：`/room/{id}/...`）。
     pub signaling_port: u16,
+    /// WebSocket 信令（QM-004，WSS）监听端口。
+    ///
+    /// 与 HTTP 信令错开两位：媒体 8080 → 信令 HTTP 8081 → WS 信令 8082。
+    /// 信令面仍与媒体/SFU 进程解耦，只是端口号连续便于内网防火墙放通。
+    pub signaling_ws_port: u16,
+    /// 每个信令房间的参会者上限（0 = 不限制）。
+    ///
+    /// 与 [`Self::max_participants`] 分工：后者是 SFU 媒体侧的会议容量口径，
+    /// 这个上限约束的是单个信令房间的成员数，防止一个房间无限增长把广播
+    /// 变成线性放大。
+    pub signaling_max_per_room: usize,
+    /// 单条信令帧的字节上限。超过即断开该连接。
+    ///
+    /// SDP 通常 2–6 KB，ICE candidate 单行远小于 1 KB，1 MB 已留出两个数量级
+    /// 余量；同时把"大帧内存耗尽"这条拒绝服务面在协议层掐掉。
+    pub signaling_max_frame_bytes: usize,
 }
 
 impl Default for MediaConfig {
@@ -108,6 +124,9 @@ impl Default for MediaConfig {
             max_participants: 64,
             idle_timeout_secs: 600,
             signaling_port: 8081,
+            signaling_ws_port: 8082,
+            signaling_max_per_room: 100,
+            signaling_max_frame_bytes: 1_048_576,
         }
     }
 }
@@ -246,8 +265,14 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            jwt_secret: String::new(),
+            // QM-004 强制约束：未携带有效 JWT 的连接直接拒绝。默认开启，
+            // 配一份**仅开发联调用**的密钥 —— 真实部署必须替换为现场生成的
+            // 高熵随机密钥，否则等同于把会议室大门挂在门上。
+            enabled: true,
+            jwt_secret: env_var_or(
+                "QM_AUTH_JWT_SECRET",
+                "quickmeet-dev-signaling-secret-change-me-32b",
+            ),
             jwt_algorithm: "HS256".to_string(),
             jwt_exp_secs: 86_400,
             jwt_clock_skew_secs: 60,
@@ -255,9 +280,28 @@ impl Default for AuthConfig {
             jwt_issuer: String::new(),
             jwt_audience: String::new(),
             jwt_required_domain: String::new(),
-            tls: TlsConfig::default(),
+            // QM-004 强制约束：信令通道强制 WSS，禁止明文传输。默认启用，
+            // 未配置证书时启动期自动自签（内网联调零配置），生产替换为受信任 CA。
+            tls: TlsConfig {
+                enabled: true,
+                ..Default::default()
+            },
         }
     }
+}
+
+/// 读取环境变量；未设置时返回给定默认值。
+fn env_var_or(key: &str, fallback: &str) -> String {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_string();
+            if v.is_empty() {
+                fallback.to_string()
+            } else {
+                v
+            }
+        })
+        .unwrap_or_else(|_| fallback.to_string())
 }
 
 impl AuthConfig {
@@ -594,6 +638,32 @@ impl AppConfig {
         if self.media.signaling_port == 0 {
             return Err(Error::config("media.signaling_port 不能为 0"));
         }
+        if self.media.signaling_ws_port == 0 {
+            return Err(Error::config("media.signaling_ws_port 不能为 0"));
+        }
+        // 两个信令面必须错开端口：HTTP 信令（旧 REST 面）与 WSS 信令并存，
+        // 配成同一端口时后启动的那个必然 bind 失败，但错误信息会指向内核。
+        if self.media.signaling_ws_port == self.media.signaling_port {
+            return Err(Error::config(format!(
+                "media.signaling_ws_port ({}) 不能与 media.signaling_port 相同（两个信令面并存，必须错开）",
+                self.media.signaling_ws_port
+            )));
+        }
+        if self.media.signaling_max_frame_bytes < 1024 {
+            return Err(Error::config(
+                "media.signaling_max_frame_bytes 不能小于 1024（一条 SDP 就远超该值）",
+            ));
+        }
+        if self.media.signaling_max_frame_bytes > 8 * 1024 * 1024 {
+            return Err(Error::config(
+                "media.signaling_max_frame_bytes 不能超过 8 MiB（信令帧没有这么大的合法负载）",
+            ));
+        }
+        if self.media.signaling_max_per_room > 512 {
+            return Err(Error::config(
+                "media.signaling_max_per_room 不能超过 512（房间广播的内存与 CPU 都随成员数线性增长）",
+            ));
+        }
         if self.network.cidrs.is_empty() {
             return Err(Error::config(
                 "network.cidrs 不能为空（私有化部署需声明允许的内网网段）",
@@ -772,7 +842,13 @@ fn known_section(section: &str, field: &str) -> bool {
         (section, field),
         (
             "media",
-            "port" | "max_participants" | "idle_timeout_secs" | "signaling_port"
+            "port"
+                | "max_participants"
+                | "idle_timeout_secs"
+                | "signaling_port"
+                | "signaling_ws_port"
+                | "signaling_max_per_room"
+                | "signaling_max_frame_bytes"
         ) | ("network", "cidrs" | "bind_host")
             | ("logging", "level" | "file_dir" | "json")
             | ("storage", "data_dir" | "encrypted")
@@ -883,20 +959,30 @@ mod tests {
     }
 
     #[test]
-    fn auth_defaults_are_off_and_valid() {
-        // 默认关闭鉴权（本地联调逃生口），但配置本身必须合法 ——
-        // 强制 WSS 的把关在信令服务启动时，不在 config::validate。
+    fn auth_defaults_enforce_qm004_and_are_valid() {
+        // QM-004 两条强制约束在默认配置里就要生效：
+        //   * JWT 强制鉴权（默认开启 + 带开发联调用密钥）；
+        //   * 信令通道强制 WSS（`tls.enabled = true`）。
+        // 逃生口是给**本地联调**用的显式动作（`auth.enabled = false`），
+        // 不是默认值；否则默认部署等于把会议室大门挂在门上。
+        //
+        // 注意：`auth.validate()` 只校验"填了就必须填对"，WSS 是否必须开启由
+        // 信令服务启动时把关（`server::start_ws`），媒体 / 集群不需要 WSS。
         let cfg = AppConfig::default();
-        assert!(!cfg.auth.jwt_active());
-        assert!(!cfg.auth.wss_required());
+        assert!(cfg.auth.enabled, "QM-004：JWT 鉴权默认开启");
+        assert!(cfg.auth.jwt_active(), "QM-004：默认带联调密钥，鉴权实际生效");
+        assert!(cfg.auth.jwt_secret.len() >= 32, "默认密钥必须 ≥ 32 字节");
+        assert!(cfg.auth.wss_required(), "QM-004：信令通道默认强制 WSS");
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn auth_validate_rejects_enabled_without_secret() {
         // 最典型的"以为开了其实没开"：开关打开但密钥是空的。
+        // 默认配置自带一张联调密钥（本地零配置起得来），这里必须显式清空才能命中这条校验。
         let mut cfg = AppConfig::default();
         cfg.auth.enabled = true;
+        cfg.auth.jwt_secret = String::new();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("jwt_secret"), "{err}");
     }

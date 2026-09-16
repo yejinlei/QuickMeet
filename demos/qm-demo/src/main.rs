@@ -31,6 +31,11 @@ struct Args {
     #[arg(long)]
     signal: bool,
 
+    /// 启动 WSS WebSocket 信令（QM-004）：监听 media.signaling_ws_port，
+    /// 握手阶段强制 JWT + WSS。
+    #[arg(long)]
+    wss: bool,
+
     /// 媒体服务监听地址（覆盖配置的 network.bind_host，本机测试用 127.0.0.1）
     #[arg(long)]
     bind: Option<String>,
@@ -70,10 +75,33 @@ fn run() -> anyhow::Result<()> {
     print_codec_report(args.frames)?;
     save_json_report(&cfg, args.frames, args.json_report)?;
 
-    // `--signal` 会把 `cfg` move 进 runtime，所以提前克隆一份句柄。
+    // QM-004：WSS WebSocket 信令。独立端口、独立进程，与媒体（8080）和
+    // REST 信令面（--signal）都不共享监听器。
+    if args.wss {
+        tracing::info!(
+            ws_port = cfg.media.signaling_ws_port,
+            "启动 WSS WebSocket 信令（QM-004，Ctrl+C 退出）"
+        );
+        let ws_cfg = Arc::new(cfg.clone());
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let router =
+                    qm_signaling::ws::WsRouter::new(qm_signaling::SignalRouter::new(ws_cfg.clone()));
+                tokio::select! {
+                    r = qm_signaling::server::start_ws(ws_cfg, router) => r?,
+                    _ = tokio::signal::ctrl_c() => { tracing::info!("收到 Ctrl+C，demo 退出"); }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+        return Ok(());
+    }
+
+    // `--signal` / `--wss` 都会把 `cfg` move 进 runtime，所以提前克隆一份句柄。
     if args.signal {
         tracing::info!("启动信令服务（Ctrl+C 退出）");
-        let signal_cfg = Arc::new(cfg);
+        let signal_cfg = Arc::new(cfg.clone());
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?

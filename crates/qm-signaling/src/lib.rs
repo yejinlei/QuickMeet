@@ -25,12 +25,22 @@
 //! * **Epic 约束 5（数据本地化）** —— 信令侧不持久化任何媒体载荷，状态只存在进程内存，
 //!   进程退出即清空；房间为空会自动回收。
 //!
+//! WebSocket / WSS 信令（QM-004）见 [`ws`]（协议：SDP / ICE 转发 + 乱序重排）与
+//! [`server`]（传输：WSS + 握手阶段 JWT 门禁，[`server::start_ws`] 启动）：
+//! * **JWT 强制** —— 未携带有效 JWT 的连接在握手阶段返回 HTTP 401，`101 Switching
+//!   Protocols` 不会发出，拿不到任何会议信息；
+//! * **WSS 强制** —— 端口上只有 TLS 监听器，明文 `ws://` 客户端走不到 TLS 握手
+//!   即被拒；`auth.tls.enabled = false` 时服务直接拒绝启动；
+//! * **与 SFU 解耦** —— WSS 信令独占 `media.signaling_ws_port`（默认 8082），
+//!   不接触媒体端口 8080。
+//!
 //! hyper / tokio 只被 [`SignalHttp`] / [`start`] 用到；路由核心（[`SignalRouter::route`]）
 //! 不触碰它们，因此单测可以完全离线断言路由逻辑。
 
 pub mod auth;
 pub mod ice_gateway;
 pub mod rooms;
+pub mod server;
 pub mod ws;
 
 use std::net::{IpAddr, SocketAddr};

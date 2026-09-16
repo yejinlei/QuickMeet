@@ -481,7 +481,10 @@ mod tests {
 
     #[test]
     fn disabled_verifier_falls_back() {
-        let v = JwtVerifier::new(&qm_common::AuthConfig::default());
+        // QM-004 之后默认配置强制开启鉴权，这里必须显式关掉开关才能测降级路径。
+        let mut c = qm_common::AuthConfig::default();
+        c.enabled = false;
+        let v = JwtVerifier::new(&c);
         assert!(!v.enabled());
         assert!(v.verify("Bearer x").is_err());
     }
