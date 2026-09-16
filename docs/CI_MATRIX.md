@@ -11,6 +11,9 @@
 | `compose-legacy` → **ubuntu / docker-compose 1.29.2 / 容器健康检查** | ubuntu-22.04 + docker + **docker-compose 1.29.2** | Dockerfile 构建、compose 语法与 1.29.2 兼容校验、`up -d --build`、五容器健康检查、`/healthz` 探活、逐个 restart 自愈验证 | 15 min |
 | `windows-webrtc` → **windows-latest / MSVC / qm-media --features webrtc** | windows-latest + MSVC `cl.exe` | `cargo test -p qm-media --features webrtc --locked`（本机只有 MinGW，跑不到这一条） | 15 min |
 | `pr-title` → **PR 标题 QM-00x: xxx 约定** | ubuntu-22.04 | PR 标题必须匹配 `^(QM-\d{3}\|YEJ-\d+): .+`，固化标题约定并保证 Issue 自动关联 | 5 min |
+| `workflow-lint` → **workflow 语义校验（YEJ-114）** | ubuntu-22.04 + python3 | 跑 `scripts/verify-workflows.sh`（与本地预检**同一份脚本**）：校验所有 workflow 的 YAML 语义陷阱、job 结构、`uses:` 依赖来源与固定 ref、`timeout-minutes ≤ 15`；脚本末尾再跑 7 个反例自证 | 5 min |
+
+> 本表最后一列的超时与 `ci.yml` 里各 job 的 `timeout-minutes` 一致；改任一处都要同步改另一处。
 
 > **两个名字别混用**：`rust-msrv` 这类是 workflow 里的 `jobs.<id>`，
 > 只在 `needs:` / `${{ }}` 表达式里有效；**分支保护的
@@ -33,9 +36,10 @@
 ## 1. 本地一键验证
 
 ```bash
-bash scripts/verify.sh                # 全部 9 步（需要 docker + docker-compose）
-bash scripts/verify.sh --no-docker    # 跳过容器步骤（本机没有 Docker 时用）
+bash scripts/verify.sh                # 全部 10 步（步骤 6-9 需要 docker + docker-compose）
+bash scripts/verify.sh --no-docker    # 跳过容器步骤（本机没有 Docker 时用；步骤 10 照跑）
 STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
+STEPS=10 bash scripts/verify.sh --no-docker          # 只跑 workflow 校验（最快，秒级）
 ```
 
 步骤编号在本地与 CI 里是**同一套**（脚本头部的注释与下表一一对应）：
@@ -51,8 +55,13 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
 | 7 | compose 1.29.2 兼容黑名单扫描 + `docker-compose config` | `compose-legacy` |
 | 8 | `docker-compose up -d --build` + 五容器全部 `healthy` + 四个 `/healthz` 返回 200 | `compose-legacy` |
 | 9 | 逐个 `docker restart`，验证 `restart: unless-stopped` 自愈、无循环重启 | `compose-legacy` |
+| 10 | `scripts/verify-workflows.sh`：workflow YAML 语义校验 + 7 个反例自证（不依赖 docker，`--no-docker` 时也跑） | `workflow-lint` |
 
 > 步骤 8 里重启次数 >6 次就判定「循环重启」并失败；这是 QM-015 验收标准 2 的机器化判据。
+>
+> `STEPS` 的选择是按**整数字符串精确匹配**（数组比较），不是子串匹配。
+> 旧的写法 `case " $STEPS " in *" 1 "*` 会让 `want 1` 与 `want 10` 互相命中
+> （尾部空格使 `" 1 "` 成为 `" 10 "` 的前缀），加第 10 步后才暴露这个问题。
 
 ## 2. 各 QM 验收标准的覆盖
 
@@ -124,6 +133,7 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
 | 2 | 健康检查正常、无启动失败、无循环重启 | 自动 | 步骤 8（五容器 `healthy`，重启次数 >6 判失败）+ 步骤 9（逐个 restart 后必须回到 `healthy`） |
 | 3 | 网页端访问/建会/入会 | 未覆盖 | 前端未交付（QM-012） |
 | 4 | 改配置重启即生效 | 半自动 | `qm-common` 配置加载单测（步骤 3）覆盖 `default.toml` → `local.json` → `QM_*` 的覆盖顺序与 fail-fast；「重启即生效」端到端需手工验 |
+| 5 | （并入 YEJ-114）新增/修改 workflow 前必须本地过预检 | 自动 | 步骤 10 / `workflow-lint`：`scripts/verify-workflows.sh` 校验 YAML 语义陷阱、job 结构、`uses:` 依赖来源与固定 ref、`timeout-minutes ≤ 15`，并在末尾跑 7 个反例自证 |
 
 ### QM-018 本 Issue（PR/CI 验收链路）
 
@@ -134,12 +144,46 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
 | 3 | windows-latest 上 `cargo test -p qm-media --features webrtc` 通过 | 自动 | **windows-latest / MSVC / qm-media --features webrtc**（先断言 `cl.exe` 存在，避免「静默跳过」假绿） |
 | 4 | 每个 QM 验收项能指到 CI job 或本地命令 | 自动 | 就是本文档第 2 节 |
 | 5 | 单次 CI 运行 ≤15 分钟 | 自动 | 每个 job 的 `timeout-minutes`；实际耗时看 run 详情（首次冷缓存可能接近上限） |
+| 6 | （并入 YEJ-114）workflow 自身的语义与依赖校验，不引入私有依赖 | 自动 | `workflow-lint` job + 本地步骤 10 跑同一份 `scripts/verify-workflows.sh`：`uses:` 走 owner 白名单（`actions` / `actions-rs` / `dtolnay` / `swatinem` / `ilammy`）且必须 pin tag 或 SHA，禁止本地路径与分支名；该 job 自身只依赖 `actions/checkout@v4`，不引入任何未经验证 API 的第三方 action |
 
 > QM-007 ~ QM-014、QM-016 ~ QM-017、QM-019 ~ QM-022 尚未交付代码，
 > 它们的验收项当前**全部未覆盖**，等对应 Issue 交付后再回到本表补一行。
 > 补规则：新增验收项必须同时给出「自动 / 半自动 / 未覆盖」三档之一的判定与具体 job 或命令。
 
-## 3. 本表自身的维护约定
+## 3. workflow 编写约定（YEJ-114 并入 QM-015）
+
+> **硬规则：新增或修改 `.github/workflows/*.yml` 的 PR，合并前必须本地跑过
+> `bash scripts/verify-workflows.sh` 且退出码 0。**
+> 这条由 CI job `workflow-lint` 自动兜底（它与本地预检是**同一份脚本**，
+> `scripts/verify-workflows.sh`，不依赖任何第三方 action），但本地先跑能省一轮
+> 失败的 CI 排队。校验内容：YAML 语义陷阱、job 结构（`runs-on` /
+> `timeout-minutes` / `steps`）、`uses:` 依赖来源与固定 ref、`timeout-minutes ≤ 15`。
+> 脚本末尾还会跑 7 个反例自证，用来证明**校验器本身没失效**。
+
+### 三个真实踩过的坑与修法
+
+| 坑 | 触发形态 | 表象 | 修法 |
+| --- | --- | --- | --- |
+| `on:` 被 YAML 1.1 吞成布尔 | 顶层 `on:` 不加引号（**这是 Actions 的标准写法**） | 用 pyyaml / yq / 部署脚本读这个文件时，顶层键是 Python 的 `True` 而不是 `"on"` | **不要**因此把 `on:` 改成 `"on":`。Actions 有自己的解析器，不受 YAML 1.1 影响，workflow 照常运行；被坑的是任何消费 pyyaml 输出的工具。所以校验器**不能**断言「解析结果必须有 `on` 键」（那样每个正常的 Actions workflow 都会误报），而是做**文本层 vs 解析层对账**：把文本里的顶层键与解析后的键集合比一下，差集必须全部落在 YAML 1.1 的 bool 字面量集合 `{on, off, yes, no, true, false, y, n}` 里；出现集合外的差集键才是真正的事故 |
+| job id 含点号 | `rust-1.75`、`compose-1.29.2` | Actions 把 job id 放进表达式上下文按 JSONPath 解析，点号被当成取字段，报 `Can get expression value only for Object or Array, got: 'Number'`，**整个 workflow 静默不执行** —— 表象是「CI 没跑」，不是语法错误 | job id 只用 `[A-Za-z0-9_-]`，版本号留在 `name:` 里给人看（如 id `rust-msrv` + name `ubuntu / Rust 1.75 / workspace 全绿`）。校验器断言 id 字符集 |
+| `name:` 含「冒号+空格」没加引号 | `name: PR 标题 QM-00x: xxx 约定` | YAML 把它当成 inline mapping，要么解析报错，要么 `name` 解析成 dict | 含「冒号+空格」时给整个值加引号：`name: "PR 标题 QM-00x: xxx 约定"`。校验器断言 job 级与 step 级的 `name` 解析出来都是字符串 |
+
+### 其他约定（同样由 `workflow-lint` 机器判据兜住）
+
+1. 每个 job 必须有 `runs-on`、`timeout-minutes`（且 ≤ 15 分钟，Issue 约束的 CI 预算上限）、
+   非空 `steps`；每个 step 必须有 `uses` 或 `run`。
+2. `uses:` 只允许**公开仓库 + 固定 ref**（tag 或提交 SHA）。禁止本地路径（`./`）、
+   `docker://`、无 ref（会解析到默认分支 HEAD 而漂移）、分支名（`main` / `master`）。
+   owner 走白名单 —— 白名单里的都是社区公开 action；**加一个 owner 等于引入新的
+   供应链依赖，必须在 PR 里写明理由**。
+3. 顶层 `permissions:` 必须显式声明最小权限（缺了直接判失败，不是提示）；
+   `concurrency:` 建议声明（缺了只提示）。
+4. `workflow-lint` job 自身只做依赖校验这件事，它的依赖只有 `actions/checkout@v4`，
+   **不引入任何 API 未经核实的第三方 action**。曾考虑过用官方的
+   `action-validator` 类 action，但无法在不联网的环境下核实其参数契约，
+   提交一个未经验证的 action 调用会在首次 CI 上直接失败 —— 本地脚本是更稳的选择。
+
+## 4. 本表自身的维护约定
 
 1. 新增或修改 `QM-0xx` 的验收标准时，**同一个 PR 内**更新本表，否则 **PR 标题 QM-00x: xxx 约定** 之外的
    review 环节会打回（文档滞后与代码不一致是 Epic 明确禁止项）。
@@ -147,18 +191,25 @@ STEPS="1 3 4 5" bash scripts/verify.sh --no-docker   # 只跑指定步骤
    （例如「重启次数 >6 判失败」），不要只写「跑了 xxx」。
 3. 「未覆盖」项必须写清本地命令或明确写「当前无法机器验证」，禁止留空。
 4. 表格里引用的 job 名改了就同步改 CI 文件，两处必须一致。
+5. 改 `.github/workflows/*.yml` 时同步跑第 3 节的本地预检（见该节的硬规则）。
 
-## 4. 已知缺口（本次交付未覆盖）
+## 5. 已知缺口（本次交付未覆盖）
 
-- **分支保护已开启**（`main` 分支，本次交付已 PUT）。注意 contexts 必须填
+- **分支保护已开启**（`main` 分支，QM-018 交付时已 PUT）。注意 contexts 必须填
   **check-run 显示名**而不是 job id —— 填成 job id（`rust-msrv` 等）时保护规则
   对不存在的状态永远卡住、也永远放不了行。开启命令：
   `gh api --method PUT repos/yejinlei/QuickMeet/branches/main/protection`（`-f` 会把 JSON
   字符串化，用 `--input <file>`；`restrictions` 必须给，个人仓库传 `null`）。
-  当前 4 条 contexts：`ubuntu / Rust 1.75 / workspace 全绿`、
+  QM-018 交付时配置的是 4 条 contexts：`ubuntu / Rust 1.75 / workspace 全绿`、
   `ubuntu / docker-compose 1.29.2 / 容器健康检查`、
   `windows-latest / MSVC / qm-media --features webrtc`、`PR 标题 QM-00x: xxx 约定`。
-  改 job `name` 之后 contexts 不会自动跟着变，必须重新 PUT。
+
+  ⚠️ **本 PR 新增了第 5 个 job `workflow-lint`（显示名 `workflow 语义校验（YEJ-114）`），
+  分支保护需要重新 PUT 一次把这条 context 加进去** —— contexts 不会自动跟随 workflow 变化。
+  注意括号是全角的，`required_status_checks.contexts` 必须逐字符匹配显示名，
+  填成英文括号 `()` 会挂不到任何状态、把 `main` 卡死。
+  本 PR 没有擅自 PUT（分支保护是仓库级设置，需要人工确认），由 reviewer / 仓库维护者
+  在合并前或合并后补这一次 PUT。
 - **首次 CI 运行时长未经实测**：冷缓存下载 + Dockerfile 首次编译可能接近 15 分钟上限，
   第一次跑完后可把 `rust-cache` 的 key 收紧以稳定耗时。
 - **浏览器/端到端类验收（QM-001-2、QM-002 全部、QM-003-1 视觉项等）未覆盖**：

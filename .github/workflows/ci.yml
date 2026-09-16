@@ -8,6 +8,12 @@
 #   * windows-webrtc   —— windows-latest + MSVC 下 `cargo test -p qm-media --features webrtc`，
 #                         这是本机（只有 MinGW）跑不到的那一条路。
 #   * pr-title         —— PR 标题必须符合 `QM-00x: xxx`（各 Issue 正文已要求该格式）。
+#   * workflow-lint    —— 校验本文件与所有 workflow 的 YAML 语义
+#                         （YEJ-114 并入 QM-015）：on 是否被 YAML 1.1 吞成 bool、
+#                         job id 是否含点号、name 是否被当成 inline mapping、
+#                         uses: 是否只用公开仓库且固定 ref、timeout 是否超 15 分钟。
+#                         跑 `scripts/verify-workflows.sh`，与本地预检是同一份脚本，
+#                         不依赖任何第三方 action。
 #
 # 约束（Issue QM-018 强制约束）：
 #   * 不依赖任何私有凭据：全部工件来自 crates.io / docker hub / GitHub 官方 release。
@@ -18,6 +24,8 @@
 #   * 每个 job 单独 timeout-minutes: 15，满足「单次 CI 运行 ≤15 分钟」。
 #
 # 本地与 CI 跑同一份脚本 `scripts/verify.sh`，避免「本机过、CI 挂」。
+# workflow 校验同理：本地 `scripts/verify-workflows.sh` = CI job `workflow-lint`
+# 跑的同一个文件，且脚本自带 7 个反例自证 —— 校验器失效会被自己挡下来。
 
 name: CI
 
@@ -146,8 +154,11 @@ jobs:
       - name: 进入 MSVC 开发环境（cl.exe 进 PATH）
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 安装 Rust stable（MSVC 宿主）
-        uses: dtolnay/rust-toolchain@stable
+      # 这里也 pin 到 1.75.0 而不是 @stable：ref 必须固定（tag / SHA），
+      # 用分支名会让校验结果随上游漂移。1.75 的 MSVC 宿主同样能编 qm-media，
+      # 反而把「MSVC 路径」和「MSRV 路径」两个变量分开。
+      - name: 安装 Rust 1.75（MSVC 宿主）
+        uses: dtolnay/rust-toolchain@1.75.0
         with:
           profile: minimal
 
@@ -194,3 +205,29 @@ jobs:
             echo "标题必须以 'QM-00x: ' 或 'YEJ-nn: ' 开头，例如 'QM-006: 集群调度修复'"
             exit 1
           fi
+
+  # ── Job 5：workflow 自身校验（YEJ-114 并入 QM-015）──────────────
+  # 放在最后一个 job：它校验**包括自己在内**的所有 workflow。
+  # 跑的是 `scripts/verify-workflows.sh`，与本地预检同一份脚本，
+  # 不依赖任何第三方 action（满足「无私有依赖」约束）。
+  #
+  # 为什么值得单独一个 job：YAML 1.1 会静默改语义，肉眼 diff 看不出来，
+  # 而这类错误的表现是「CI 静默不跑」而不是「语法报错」，极难定位。
+  # 脚本末尾的 7 个反例自证会反过来验证校验器本身没失效。
+  workflow-lint:
+    # name 不含「冒号+空格」，所以不用加引号（含的话必须加，见 pr-title 的注释）。
+    name: workflow 语义校验（YEJ-114）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 确认 pyyaml 可用
+        run: |
+          python3 -V
+          python3 -c 'import yaml; print("pyyaml", yaml.__version__)'
+
+      - name: workflow 预检（含 7 个反例自证）
+        run: bash scripts/verify-workflows.sh
