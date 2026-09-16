@@ -1,13 +1,17 @@
-# QuickMeet Stage 1 镜像
+# QuickMeet 运行镜像（QM-015）
 #
-# 基于 Rust 1.75 官方镜像 —— 与验收标准 1 的 MSRV 要求一致。
-# 默认构建**不启用**任何 C 工具链相关的依赖：编解码是纯 Rust 确定性封装，
-# webrtc-rs（需要 ring 的 C 编译）是 optional feature，默认不编译。
-FROM rust:1.75-slim
+# 构建阶段用 rust:1.75（官方镜像）编译 release，运行阶段用 debian:bookworm-slim
+# （官方镜像）只放二进制与配置。两个基础镜像都来自 Docker Hub 官方命名空间，
+# 不引入任何不明来源镜像，也不带任何 tag 漂移风险 —— 见 docs/DEPLOYMENT.md 的
+# 「镜像来源」一节。
+#
+# MSRV 1.75 与 Issue 全局约束 1 对齐；运行阶段与编译解耦后镜像从 ~1.2 GB 降到
+# 几十 MB（Issue 交付要求「多阶段构建精简镜像体积」）。
+FROM rust:1.75 AS builder
 
-# slim 镜像不带 gcc，而 Cargo 构建 proc-macro / 少量 -sys crate 时需要一个 C 链接器。
-# curl / wget 是 docker-compose.yml 里 healthcheck 的命令（1.29.2 用 POST 探活），
-# 只加这两个，不装 MSVC / Visual Studio Build Tools。
+# rust:1.75 已是 slim 变体，不带 gcc。ring（async-nats 默认 features 的传递依赖，
+# rustls → ring）的 build.rs 需要它，proc-macro crate 也需要链接器。
+# curl / wget 留给运行阶段的 docker healthcheck（见 docker-compose.yml）。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl wget \
     && rm -rf /var/lib/apt/lists/* \
@@ -15,27 +19,43 @@ RUN apt-get update \
 
 WORKDIR /opt/quickmeet
 
-# 先复制清单，利用 Docker 层缓存：依赖没变时不用重新下载 crates.io。
+# 先复制清单，利用层缓存：依赖没变时不用重新下载 crates.io。
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY crates crates
 COPY demos demos
 
-# release 构建。--locked 保证与仓库里的 Cargo.lock 一致。
 RUN cargo build --release --locked
 
-# 拷入配置模板（不含 local.json，那是现场覆盖，应通过 volume 挂载）。
+# ── 运行阶段 ────────────────────────────────────────────────────────
+# debian:bookworm-slim 是 rust:1.75-slim 的基座同代镜像，glibc 版本一致，
+# 静态检查过的 release 二进制直接可跑，不需要带任何 Rust 工具链进镜像。
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    # 1000 用户在 slim 镜像里不一定存在，显式建一个非 root 运行身份。
+    && groupadd --system --gid 1000 app \
+    && useradd --system --uid 1000 --gid app --create-home --home-dir /home/app app
+
+WORKDIR /opt/quickmeet
+
+# 只拷二进制，不带 target 目录（调试符号、增量编译中间产物都不进镜像）。
+COPY --from=builder /opt/quickmeet/target/release/qm-demo ./qm-demo
 COPY config config
 RUN mkdir -p /opt/quickmeet/data /opt/quickmeet/logs \
-    && chown -R 1000:1000 /opt/quickmeet
+    && chown -R 1000:1000 /opt/quickmeet \
+    && chmod +x /opt/quickmeet/qm-demo
 
 # 非 root 运行（容器安全基线）。
 USER 1000
 
-# 媒体服务默认监听 8080（Epic 全局约束），信令 8081。
-EXPOSE 8080 8081
+# 媒体服务默认监听 8080（Epic 全局约束），信令 8081，集群健康探针 8090。
+EXPOSE 8080 8081 8090
 
-# 默认跑编解码收发验证；带 --signal 才起信令服务，带 --cluster 进集群模式。
-# 集群参数由 docker-compose.yml 的 media 服务显式传（见那边的 command:），
-# 不写在这里 —— CMD 只是默认值，三个节点必须各自带 --cluster 才会互认识。
-CMD ["./target/release/qm-demo", "--bind", "0.0.0.0"]
+# 默认跑编解码收发验证；带 --signal 起信令服务，带 --cluster 进集群模式。
+# 集群参数由 docker-compose.yml 各服务显式传（只有 CMD、没有 ENTRYPOINT，
+# 所以 command 必须是完整命令行字符串），CMD 只是 `docker run` 的默认值。
+CMD ["./qm-demo", "--bind", "0.0.0.0"]

@@ -1,43 +1,102 @@
-# QuickMeet — docker-compose
+# QuickMeet — docker-compose（QM-015）
 #
-# 兼容性约束（Epic YEJ-89）：必须能在 docker-compose 1.29.2 下运行，
+# 兼容性约束（Epic YEJ-89）：必须能在 **docker-compose 1.29.2** 下运行，
 # 因此本文件**不使用** compose 2.x / docker-compose-plugin 才有的语法：
 #   - 没有 deploy: 段（1.29.2 会直接拒绝）
-#   - 没有 YAML anchor / alias（v3.x 规范不支持）
+#   - 没有 YAML anchor / alias（v3.8 规范不支持）
 #   - 没有 extends: / develop: / secrets: / config:
-#   - 没有 include:、没有多行 build.contexts、没有 target:
+#   - 没有 include:、没有多行 build.contexts、没有 build.target
 #   - 重启策略用服务级 restart:（v3 语法），不写在 deploy.restart_policy 里
 #   - build 用短语法，context 不越过仓库根目录
 #   - 用 environment: 逐服务覆盖节点身份，不靠 anchor 复用
 #
-# command 必须是**完整命令行字符串**，且用 shell form（带引号的字符串）。
-# 这是 CI 第一次实跑在 compose 1.29.2 下 `up -d` 失败的直接原因：
-#   exec: "--bind": executable file not found in $PATH
-# Dockerfile 里写的是 `CMD ["./target/release/qm-demo", ...]`——只有 CMD、
-# 没有 ENTRYPOINT，所以 Config.Entrypoint 是空的。compose 的 command 覆盖的是
-# 整个 Cmd（不是往 ENTRYPOINT 后面追加参数），于是数组形式的
-# `command: [--bind, 0.0.0.0, --cluster]` 把 Cmd 设成了
-# ["--bind", "0.0.0.0", "--cluster"]，Docker 拿第一个元素当可执行文件去 exec，
-# 自然是 "--bind: executable file not found in $PATH"。
-# 写成字符串后走 shell form（/bin/sh -c "..."），程序名必须在字符串里带上。
-# 注意：这次失败**不是** healthcheck 被丢弃 —— qm-nats 没有 command 覆盖，
-# `docker inspect .State.Health.Status` 正常返回 starting，healthcheck 定义完好；
-# verify.sh 步骤 9 里四个容器报 no-healthcheck，是因为它们压根没启动起来。
+# 本机没有 docker 预检不了，所以本文件的语法合规由 CI 兜底：
+# `scripts/verify-workflows.sh`（YAML 语义陷阱，workflow 侧）+
+# `scripts/verify.sh` 步骤 7/7b（真实 1.29.2 二进制的 `docker-compose config`）。
 #
-# 运行：
+# ── command 的坑（CI 第一次实跑踩过）──────────────────────────────
+# command 必须是**完整命令行字符串**，走 shell form。
+# Dockerfile 里只有 CMD、没有 ENTRYPOINT，compose 的 command 覆盖的是整个
+# Cmd（不是往 ENTRYPOINT 后面追加参数），于是数组形式的
+# `command: [--bind, 0.0.0.0, --cluster]` 让 Docker 拿 "--bind" 当可执行文件
+# 去 exec，报 `exec: "--bind": executable file not found in $PATH`。
+#
+# ── 地址模型（本卡新增，容易写错）─────────────────────────────────
+# 容器网络**不用** 192.168.0.0/24，保持 Docker 默认 bridge 子网。原因：
+# advertised_addr 必须同时被「内网里的浏览器」和「其他容器」访问到，
+# 在单机部署下只有**宿主机 IP + 端口映射**能同时满足两边。如果把容器
+# 子网也设成 192.168.0.0/24，容器 IP 和宿主机 LAN IP 会变成同一个
+# 192.168.0.10 —— 浏览器拿到 advertised_addr 后到底连谁就不可预测了。
+#
+# 所以各节点的 QM_CLUSTER_ADVERTISED_ADDR 写的是**宿主机侧地址**
+# （宿主机内网 IP + 映射出的端口）。其他容器访问这个地址时会走宿主机的
+# Docker DNAT 绕一圈（hairpin），功能正确，只是多一跳，集群判活不受影响。
+#
+# 现场改法：如果宿主机内网 IP 不是 192.168.0.10，把三个节点的
+# QM_CLUSTER_ADVERTISED_ADDR 的 IP 段改成宿主机实际 IP（端口保持不变）。
+#
+# ── 运行 ─────────────────────────────────────────────────────────
 #   docker-compose up -d --build        # 1.29.2 的 CLI，不是 docker compose
 #   docker-compose ps
 #   docker-compose logs -f qm-media
 #   docker-compose down
 #
-# 节点身份说明：3 个媒体节点共用一个 NATS（qm-nats），靠 QM_CLUSTER_NODE_ID
-# 与 QM_CLUSTER_ADVERTISED_ADDR 区分自己。扩容只需复制一份 qm-media-* 服务、
+# 一键脚本（适配 MobaXterm SSH 操作）：
+#   bash scripts/qm-up.sh          # 构建 + 拉起全套 + 等五容器 healthy
+#   bash scripts/qm-upgrade.sh     # 拉新代码重建，逐个滚动重启，数据卷不动
+#   bash scripts/qm-down.sh        # 停止并移除容器（默认保留数据卷）
+#
+# ── 节点身份 ─────────────────────────────────────────────────────
+# 3 个媒体节点共用一个 NATS（qm-nats），靠 QM_CLUSTER_NODE_ID 与
+# QM_CLUSTER_ADVERTISED_ADDR 区分自己。扩容只需复制一份 qm-media-* 服务、
 # 改这两个变量与端口映射，不需要重建镜像、也不需要重启现有节点。
 #
 # 媒体节点用 command: 显式传 --cluster（QM-006）进入集群模式：连接 NATS、
 # 加入集群、运行心跳/调度/故障迁移循环。Dockerfile 的 CMD 只是默认值
 # （不带 --cluster 时跑编解码验证报告就退出），所以集群参数必须在这里写，
 # 否则三个节点起来后互不认识。
+#
+# ── 故意不写的占位服务（按实际存在的服务编排）──────────────────────
+# 本仓库当前**只有一个二进制** qm-demo（见 demos/qm-demo），SFU 的代码在
+# qm-sfu crate 里但没有任何进程入口 —— 所以没有单独的 SFU 镜像。以下服务
+# 按 Issue 要求留好扩展位，等对应 Issue 交付后解开注释即可：
+#
+#   # SFU 选择性转发：qm-sfu crate 已实现，尚无独立进程入口（QEJ-91 遗留）。
+#   #   qm-sfu:
+#   #     build: { context: ., dockerfile: Dockerfile }
+#   #     command: "./qm-demo --bind 0.0.0.0 --sfu --cluster"   # 待 QM-002 入口
+#   #     ports: ["8080:8080"]
+#   #
+#   # AI 能力（QM-013）：只对接**本地部署**的硅基流动接口，不启公网 API。
+#   # 当前仓库没有 AI 服务的代码，不要凭空起一个容器 —— 会制造假通过。
+#   #   qm-ai:
+#   #     image: nvidia/siliconflow-vllm:<pin-version>   # 官方镜像，需 pin 版本
+#   #     ports: ["3000:3000"]
+#   #     volumes: [siliconflow-weights:/weights]
+#   #     # 容器外的调用方把 QM_AI_BASE_URL 指到 http://<host>:3000/v1
+#   #
+#   # 前端（QM-012）：当前没有前端产物，网页端验收无法自证。
+#   #   qm-web:
+#   #     build: { context: ./web, dockerfile: Dockerfile }   # nginx:alpine 静态托管
+#   #     ports: ["80:80"]
+#   #     depends_on: [qm-signaling]
+#
+# ── TURN（QM-008，未交付）────────────────────────────────────────
+# 当前所有 ICE 候选都是 host/prflx/srflx，没有 relay（TURN）路径，
+# 所以**不要**为 TURN 起容器，也不要给 QM_ICE_TURN_URL 赋真值 ——
+# 配置层没有这个键，写了会被判成未知配置项直接拒绝启动（见 container.env）。
+#   #   qm-turn:
+#   #     image: coturn/coturn:<pin-version>      # 官方镜像，需 pin 版本
+#   #     ports: ["3478:3478/udp", "3478:3478/tcp", "49152-49200:49152-49200/udp"]
+#   # 解开后同步打开 config/container.env 里的 QM_ICE_TURN_URL（键名以 QM-008 交付为准）。
+#
+# ── 旁听分发节点（可选，QM-006 验收标准 3 用）────────────────────
+#   docker-compose run --rm -d --name qm-listener-1 \
+#     -p 9080:8080 -e QM_CLUSTER_NODE_ID=listener-1 \
+#     -e QM_CLUSTER_ADVERTISED_ADDR=192.168.0.10:9080 \
+#     -e QM_CLUSTER_NODE_ROLE=listener qm-media-2
+# 旁听节点不参与调度（node_role=listener 时 is_schedulable() 为 false），
+# 只承接已分配房间的旁听流转发，可以放大单会议的只收流人数。
 
 version: "3.8"
 
@@ -46,13 +105,14 @@ services:
   # 只用 core NATS（不启用 JetStream / KV），因此无状态、无磁盘挂载需求。
   qm-nats:
     # 固定 patch 版本，不用 tag：私有化部署要求镜像可复现，
-    # 且必须能在断网环境预拉取（不依赖 docker hub 上的 tag 漂移）。
+    # 且必须能在断网环境预拉取（不依赖 Docker Hub 上的 tag 漂移）。
     image: nats:2.10.21-alpine
     container_name: qm-nats
     restart: unless-stopped
     ports:
-      - "4222:4222"
-    # NATS 自带健康端点（-/-/health），200 即存活。
+      - "4222:4222"      # NATS 客户端
+      - "8222:8222"      # 监控/健康端点（-/health 从这里看）
+    # NATS 自带健康端点（-/health），200 即存活。alpine 镜像里有 busybox wget。
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/-/health >/dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -67,10 +127,9 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # 媒体/编解码层：跑 VP8 / H.264 / Opus 收发兼容验证，并可起信令服务。
-  # 同时是本机第一个集群节点（node-1）。
+  # 媒体节点 1（node-1）：同时是本机第一个集群节点。
   #
-  # 健康探针（QM-018）：集群模式不监听 8081，没有 HTTP 端点可做探针，
+  # 健康探针：集群模式不监听 8081，没有 HTTP 端点可做探针，
   # 所以节点另起一个只读 /healthz（容器内固定 8090，宿主机暴露 8091）。
   # interval 5s × retries 2 = 10s，与配置里的「判死窗口」heartbeat 5s ×
   # misses 2 = 10s 对齐 —— 容器判死和集群判死用同一个口径。
@@ -79,16 +138,15 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: qm-media
-    # 集群模式：不写这里，节点不会进集群（见文件头说明）。
-    command: "./target/release/qm-demo --bind 0.0.0.0 --cluster"
+    command: "./qm-demo --bind 0.0.0.0 --cluster"
     restart: unless-stopped
     depends_on:
       - qm-nats
-    # 媒体服务默认监听 8080（Epic 全局约束）。
+    # 媒体服务默认监听 8080（Epic 全局约束 3）。
     ports:
       - "8080:8080"
       - "8091:8090"   # 集群健康探针（CI / 运维探活入口）
-    # 只绑内网网段：容器网络固定映射到 192.168.0.0/24 的主机侧地址。
+    # 现场调参只改这里 / config/container.env，不需要改代码或重建镜像。
     env_file:
       - config/container.env
     # 节点身份：每个集群节点必须覆盖 node_id 与 advertised_addr。
@@ -119,8 +177,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: qm-media-2
-    # 集群模式：不写这里，节点不会进集群（见文件头说明）。
-    command: "./target/release/qm-demo --bind 0.0.0.0 --cluster"
+    command: "./qm-demo --bind 0.0.0.0 --cluster"
     restart: unless-stopped
     depends_on:
       - qm-nats
@@ -149,14 +206,13 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # 集群节点 3：3 节点集群部署（验收标准 1）。
+  # 集群节点 3：3 节点集群部署（QM-006 验收标准 1）。
   qm-media-3:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: qm-media-3
-    # 集群模式：不写这里，节点不会进集群（见文件头说明）。
-    command: "./target/release/qm-demo --bind 0.0.0.0 --cluster"
+    command: "./qm-demo --bind 0.0.0.0 --cluster"
     restart: unless-stopped
     depends_on:
       - qm-nats
@@ -187,6 +243,11 @@ services:
 
   # 信令服务：独立进程，与媒体层同网段，只做内网信令路由。
   # 扩容媒体节点时不需要再加信令实例 —— 信令只负责内网信令路由。
+  #
+  # 已知缺口（QM-024 F3，未并入本基线）：`POST /room/{id}/place` 需要信令进程
+  # 也接集群，只跑 `--signal` 时该端点返回 503。等 QM-024 合入后把 command
+  # 改成 "./qm-demo --bind 0.0.0.0 --signal --cluster" 并加
+  # QM_CLUSTER_NODE_ID=node-signal / QM_CLUSTER_NODE_ROLE=listener。
   qm-signaling:
     build:
       context: .
@@ -203,7 +264,7 @@ services:
       - meeting-data:/opt/quickmeet/data:ro
     networks:
       - quickmeet
-    command: "./target/release/qm-demo --bind 0.0.0.0 --signal"
+    command: "./qm-demo --bind 0.0.0.0 --signal"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8081/healthz"]
       interval: 5s
@@ -216,24 +277,13 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # 旁听分发节点（可选，验收标准 3 用）：
-  #   docker-compose run --rm -d --name qm-listener-1 \
-  #     -p 9080:8080 -e QM_CLUSTER_NODE_ID=listener-1 \
-  #     -e QM_CLUSTER_ADVERTISED_ADDR=192.168.0.20:9080 \
-  #     -e QM_CLUSTER_NODE_ROLE=listener qm-media-2
-  #
-  # 旁听节点不参与调度（node_role=listener 时 is_schedulable() 为 false），
-  # 只承接已分配房间的旁听流转发，可以放大单会议的只收流人数。
-
 networks:
   quickmeet:
     driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 192.168.0.0/24
-          gateway: 192.168.0.1
+    # 刻意**不**写 ipam.config：容器网络用 Docker 默认子网（172.17.0.0/16），
+    # 避免与宿主机 192.168.0.0/24 的 LAN 地址重叠。原因见文件头「地址模型」。
 
+# 顶层 volumes 必须是**映射**，写成 list 会被 1.29.2 拒绝。
 volumes:
   meeting-data:
   meeting-data-2:
