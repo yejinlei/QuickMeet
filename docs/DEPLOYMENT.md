@@ -19,7 +19,11 @@ bash scripts/qm-up.sh
 | 停止 | `bash scripts/qm-down.sh`（保留数据卷） |
 | 清数据 | `bash scripts/qm-down.sh --purge`（删卷，输入 `PURGE` 二次确认） |
 | 看日志 | `docker-compose logs -f qm-media` |
-| 探活 | `curl http://<host>:8081/healthz`（信令）、`:8091/8092/8093`（三个媒体节点） |
+| 探活 | `curl http://<host>:8081/healthz`（信令）、`:8091/8092/8093`（三个媒体节点）；**503 = 集群不健康**，见下面「健康探针」 |
+
+`bash scripts/qm-up.sh` 除了等五容器 healthy，还会逐个断言三个媒体节点 JSON 里
+`nats_connected == true` 且 `cluster_nodes >= 3` —— 五容器全绿但集群没形成时会
+**退出码 1**，不会因为 `docker ps` 一片绿就报成功。
 
 ## 1. 服务与端口
 
@@ -43,12 +47,58 @@ bash scripts/qm-up.sh
 这个地址会走宿主机的 Docker DNAT 绕一圈（hairpin），功能正确，只是多一跳，
 集群判活（10s 窗口）不受影响。
 
+**单机三节点的关键点**：三个节点跑在同一台宿主机上，所以它们的 advertised_addr
+**IP 必须完全相同**（都写宿主机内网 IP），**只有端口不同**（8080 / 8082 / 8083）。
+写成 `192.168.0.11` / `192.168.0.12` 这种「看起来像每台机器各一个 IP」的地址，
+节点 2、3 会对外广播一台**不存在的机器**的地址 —— 远端节点与浏览器拿到后根本
+连不上，调度与互通都会静默失败。
+
 > **现场改法**：宿主机内网 IP 不是 192.168.0.10 时，把三个节点的
-> `QM_CLUSTER_ADVERTISED_ADDR` 的 IP 段改成宿主机实际 IP（端口保持不变）。
+> `QM_CLUSTER_ADVERTISED_ADDR` 的 IP 段**统一**改成宿主机实际 IP（三个节点写
+> 同一个 IP，端口 8080 / 8082 / 8083 保持不变）。
 > 若需要把媒体节点绑定到具体的宿主机网卡，改 `QM_NETWORK_BIND_HOST` 与
 > `ports:` 映射即可。
 >
-> 多机部署时每台宿主机填自己的内网 IP，节点之间就能直接互通，不走 hairpin。
+> 多机部署时每台宿主机填**自己**的内网 IP，节点之间就能直接互通，不走 hairpin。
+
+### 容器间的 NATS 地址：写容器服务名，不是 127.0.0.1
+
+`QM_CLUSTER_SERVER` 接受 **IPv4** 或 **DNS 主机名**。容器部署下必须写容器服务名
+`qm-nats`（compose 的服务名解析到 NATS 容器）。写成 `127.0.0.1` 语法上合法
+（配置层对回环地址做了豁免，单机直连部署需要），但它在容器里指**容器自己的
+loopback** —— NATS 根本连不上，三个节点会一直退化单机、探针持续返 503。
+
+- 多机部署（NATS 跑在另一台机器）：改成那台机器的内网 IP，例如
+  `QM_CLUSTER_SERVER=192.168.0.30`。
+- 配置层唯一不放过的是**畸形值**：IPv6、`host:port`、带空格、以连字符开头结尾、
+  通配符等，都会被 fail fast 拒绝启动，不会带着错值跑起来。
+- 多机部署时把 IP 字面量放进 `QM_NETWORK_CIDRS` 白名单才能过配置层校验；
+  写主机名时跳过网段校验（容器服务名本来就不是 IP）。
+
+### 健康探针：503 表示集群不健康，不是进程挂了
+
+四个媒体/信令节点都暴露在 `8090`（映射到宿主机的 8091 / 8092 / 8093，信令
+是 8081 上的 `/healthz`）。语义是：
+
+- **HTTP 200** —— 进程活着**且** NATS 已连接（JSON 里 `nats_connected: true`）；
+- **HTTP 503** —— 进程活着但 NATS 没连上（`nats_connected: false`，
+  `status: "degraded"`）。
+
+刻意把集群状态写进**状态码**而不是只写在 JSON 里：docker healthcheck 用的是
+`curl -f`，`-f` 只对 4xx/5xx 判失败。如果 200 无条件返回，NATS 全挂时三个节点
+照样全 healthy、`docker ps` 一片绿 —— 那是**假通过**，五容器看着正常但集群能力
+是 0。现在 NATS 挂了 healthcheck 会明确变 unhealthy。
+
+两个窗口**故意分开**，不要对齐着调：
+
+- `start_period: 90s` —— 启动窗口。NATS 连接 + 成员心跳收敛在这个窗口内，探针
+  返 503 不算故障。太短的话启动期的正常协调延迟会被算进判死窗口，触发容器重启
+  风暴。
+- `interval 5s × retries 3` —— 判死窗口 ≈ 10s，和集群自己的判活口径
+  （`heartbeat_secs 5 × unhealthy_misses 2 = 10s`）对齐。**稳态**下集群坏了
+  大概 10s 就该被发现。
+
+一句话：启动慢不是节点坏了，稳态下集群坏了一分钟就该有人看到。
 
 ## 2. 镜像来源（全部官方基础镜像）
 
@@ -80,6 +130,7 @@ Rust 依赖全部来自 crates.io（`Cargo.lock` 已钉版本），CI 里 `--loc
 | 需求 | 改哪里 | 之后 |
 | --- | --- | --- |
 | 换端口 | `config/container.env` 的 `QM_MEDIA_PORT` / `QM_MEDIA_SIGNALING_PORT`，并同步改 compose 的 `ports:` 映射 | `docker-compose up -d` |
+| 改 NATS 地址 | `QM_CLUSTER_SERVER`（容器部署写 `qm-nats`，多机写 NATS 所在机器内网 IP） | `docker-compose up -d` |
 | 改内网网段 | 只改 `QM_NETWORK_CIDRS`（JSON 数组，**不改容器网络**）；同时把三个节点的 `QM_CLUSTER_ADVERTISED_ADDR` 改成新网段下的宿主机 IP | `docker-compose up -d`（容器子网保持 172.17.0.0/16 不动，所以不需要重建网络；原因见上面「地址模型」） |
 | 调日志级别 | `QM_LOGGING_LEVEL`（注意：逗号后**不能有空格**，否则后面的 target 被静默丢弃） | `docker-compose up -d` |
 | 单节点会议上限 | `QM_CLUSTER_MAX_ROOMS_PER_NODE` | `docker-compose up -d` |
@@ -98,8 +149,29 @@ Rust 依赖全部来自 crates.io（`Cargo.lock` 已钉版本），CI 里 `--loc
 
 三个媒体节点共用一个 NATS，靠 `QM_CLUSTER_NODE_ID` / `QM_CLUSTER_ADVERTISED_ADDR`
 区分自己。判死窗口 = `heartbeat_secs × unhealthy_misses` = 5 × 2 = **10s**，与
-docker healthcheck 的 `interval 5s × retries 2` 用同一个口径 —— 容器判死和集群
-判死不会互相打架。
+docker healthcheck 的判死窗口（`interval 5s × retries 3` ≈ 10s）用同一个口径 ——
+容器判死和集群判死不会互相打架（启动窗口 `start_period 90s` 是另一回事，见
+「健康探针」一节）。
+
+### NATS 掉线怎么办：会自动重连，不用手动干预
+
+NATS 进程挂了或者容器重启期间，节点会退化成单机并立刻把 `/healthz` 变成 503。
+NATS 恢复后**不需要人工操作**：节点里的 supervisor 循环按指数退避重试连接
+（2s 起步、每次翻倍、上限 30s），连上之后自动重新注册进集群；重连成功那一刻
+会先扫一遍离线期间失联的远端节点并打日志，判死与房间迁移仍由判死循环负责
+（单一入口，避免两条路径同时驱动迁移）。
+
+验证方式：
+
+```bash
+docker stop qm-nats            # 三个节点的 /healthz 立即变 503，healthcheck 转 unhealthy
+docker start qm-nats           # 最长 30s 内自动重连
+curl http://127.0.0.1:8091/healthz   # nats_connected: true 且 cluster_nodes >= 3
+```
+
+如果 30s 后还没恢复，看 `docker-compose logs --tail 80 qm-media` 里的
+`nats_supervisor` 日志 —— 那说明 `QM_CLUSTER_SERVER` 指向的地址本身就不可达
+（常见原因：误写成 `127.0.0.1`，见「容器间的 NATS 地址」一节）。
 
 扩容不需要重建镜像，也不需要重启现有节点：复制一份 `qm-media-*` 服务、改身份与
 端口映射即可。旁听分发节点用 `docker-compose run` 起（见 compose 文件末尾的示例），

@@ -78,6 +78,11 @@ ALLOWED_ACTION_OWNERS = {
     "dtolnay",       # rust-toolchain：pin MSRV 1.75 的唯一可靠方式
     "swatinem",      # rust-cache
     "ilammy",        # msvc-dev-cmd：windows MSVC 环境
+    # 复审意见要求 workflow-lint 追加一个 action-validator 做交叉校验。注意
+    # `actions/action-validator` 在 GitHub 上**不存在**（API 404）——这个名字的
+    # 真实归属是 mpalmer/action-validator，所以白名单里加的是 mpalmer，不是
+    # 往 actions/* 里凑一个假 ref。该步骤是 continue-on-error 的非阻塞校验。
+    "mpalmer",       # action-validator（第三方，仅 workflow-lint 非阻塞交叉校验）
 }
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")

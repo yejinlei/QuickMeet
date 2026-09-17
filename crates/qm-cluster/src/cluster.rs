@@ -32,6 +32,14 @@ use crate::state::{
 /// 单节点上同时持有的 NATS 发送端数量上限（心跳 + 4 个订阅 + 若干请求）。
 const DEFAULT_PUBLISHER_CAPACITY: usize = 64;
 
+/// NATS 重连最小重试间隔（秒）。
+const NATS_RECONNECT_MIN_SECS: u64 = 2;
+/// NATS 重连最大重试间隔（秒）：指数退避的封顶。
+///
+/// 与集群判死窗口（`heartbeat_secs × unhealthy_misses` 默认 10s）放在同一个
+/// 量级：重试节奏比判死窗口拖得太窄会反而拉长故障恢复时间。
+const NATS_RECONNECT_MAX_SECS: u64 = 30;
+
 /// 集群门面。
 pub struct Cluster {
     cfg: ClusterConfig,
@@ -129,36 +137,119 @@ impl Cluster {
     /// 初始化：连接 NATS，注册自身，启动全部后台任务。
     ///
     /// 连接失败**不让进程退出** —— 节点退化为单机模式，等 NATS 恢复后
-    /// 下一跳心跳会自动重连。这是「节点动态增减、无需重启整体服务」的前提。
+    /// 初始化：连接 NATS，注册自身，启动全部后台任务。
+    ///
+    /// 连接失败**不让进程退出**：节点退化为单机模式，同时在后台启一个
+    /// 带退避的重连循环（[`Cluster::nats_supervisor`]）。重连成功后自动补注册自身
+    /// 并发布一次快照，无需人工重启容器，这是“节点动态增减、无需重启
+    /// 整体服务”的前提。
+    ///
+    /// 「未连接」与「已连接但成员还没收齐」是两件事：前者看
+    /// `status.nats_connected`，后者看 `registry.nodes()`。探针两个都给出，
+    /// 否则节点 2/3 错过第一轮快照、迟迟看不到成员时，机器判据看不出来。
     pub async fn initialize(self: Arc<Self>) {
-        let bus = match NatsBus::connect(&self.cfg, DEFAULT_PUBLISHER_CAPACITY).await {
-            Ok(b) => b,
+        match self.connect_or_degrade().await {
+            Some(bus) => {
+                self.register_cluster_membership(bus).await;
+            }
+            None => {
+                // NATS 暂时不可用：继续以单机模式运行，重连交给 supervisor。
+                let self_arc = Arc::clone(&self);
+                tokio::spawn(async move {
+                    self_arc.nats_supervisor().await;
+                });
+            }
+        }
+    }
+
+    /// 连接 NATS。成功返回 bus；失败把节点标成「未连接」并返回 `None`。
+    ///
+    /// 启动期与重连期共用这一处：错误文本、状态位、日志格式都只有一份。
+    async fn connect_or_degrade(&self) -> Option<NatsBus> {
+        match NatsBus::connect(&self.cfg, DEFAULT_PUBLISHER_CAPACITY).await {
+            Ok(b) => {
+                info!(
+                    node = %self.cfg.node_id,
+                    cluster = %self.cfg.cluster_id,
+                    role = self.cfg.node_role.as_str(),
+                    advertised = %self.cfg.advertised_addr,
+                    "节点已加入集群，等待开始承接新会议"
+                );
+                Some(b)
+            }
             Err(e) => {
                 warn!(
                     error = %e,
                     server = %self.cfg.server,
                     port = self.cfg.port,
-                    "NATS 未连接，节点退化为单机模式（将在下一跳心跳重试）"
+                    "NATS 未连接，节点退化为单机模式（后台将带退避重试）"
                 );
                 self.bump_status(|s| s.nats_connected = false);
-                return;
+                None
             }
-        };
+        }
+    }
 
+    /// NATS 后台重连循环：带指数退避，成功后自动重新加入集群。
+    ///
+    /// 只在「启动时就没连上」的路径起这一个循环。连接建立之后由 async-nats
+    /// 自己处理 ping 与断线重连，业务层不重复实现一套。
+    ///
+    /// 间隔从 [`NATS_RECONNECT_MIN_SECS`] 翻倍，到 [`NATS_RECONNECT_MAX_SECS`] 封顶，
+    /// 成功后复位。NATS 短暂抖动不会触发密集重试，长期不可用也不会放弃：
+    /// 离线期间节点持续以单机模式运行，会议照常进行。
+    pub async fn nats_supervisor(self: Arc<Self>) {
+        let mut delay = Duration::from_secs(NATS_RECONNECT_MIN_SECS);
+        loop {
+            // 用 `sleep` 而不是 `interval`：退避时长由上一次结果决定，固定的 tick
+            // 节奏会把「NATS 刚恢复」与「刚又断了」混成同一个间隔。
+            tokio::time::sleep(delay).await;
+            match self.connect_or_degrade().await {
+                Some(bus) => {
+                    info!(
+                        node = %self.cfg.node_id,
+                        waited_secs = delay.as_secs(),
+                        "NATS 已恢复，节点重新加入集群"
+                    );
+                    self.register_cluster_membership(bus).await;
+                    return;
+                }
+                None => {
+                    warn!(
+                        node = %self.cfg.node_id,
+                        next_retry_in_secs = delay.as_secs(),
+                        "NATS 仍不可用，继续单机模式"
+                    );
+                    delay = (delay * 2).min(Duration::from_secs(NATS_RECONNECT_MAX_SECS));
+                }
+            }
+        }
+    }
+
+    /// 加入集群：注册自身、发一次自己归属的房间快照、启全部后台循环。
+    ///
+    /// 注册自身与启动循环必须成对发生：只注册不启动循环，节点会在下一轮健康检查
+    /// 被判死（心跳没发出）；只启动循环不注册，本节点不可被调度。
+    async fn register_cluster_membership(self: Arc<Self>, bus: NatsBus) {
+        let bus = Arc::new(bus);
         self.alive.store(true, Ordering::SeqCst);
         self.bump_status(|s| s.nats_connected = true);
-        info!(
-            node = %self.cfg.node_id,
-            cluster = %self.cfg.cluster_id,
-            role = %self.cfg.node_role.as_str(),
-            advertised = %self.cfg.advertised_addr,
-            "节点已加入集群，等待开始承接新会议"
-        );
-
+        // 先扫一遍离线期间失联的远端节点，把自己注册进去之前先记一笔账：
+        // 否则注册表里会同时躺着自己这一批 stale 节点，这一轮的调度决策会
+        // 被离线期间的残留数据污染。注意这里**只报告不判死**——把节点标记
+        // Dead、把房间迁移走仍是判死循环（reap_dead）的专职工作，那是
+        // `dead_nodes_detected` 与两阶段迁移接手的唯一入口。
+        let stale = self.reap_dead_remote();
+        if !stale.is_empty() {
+            info!(
+                node = %self.cfg.node_id,
+                stale = stale.join(","),
+                "重连后扫到失联节点，判死与房间迁移交给判死循环"
+            );
+        }
         // 注册自身到本地注册表：让本节点立即可调度自己的房间，
         // 不必等远端心跳来回确认。
         self.register_self();
-        let bus = Arc::new(bus);
         // 加入集群时立刻发一次自己归属的房间，让其它节点马上看到本节点；
         // 之后由 snapshot_publish_loop 每个心跳周期重发（新节点靠它追上全量状态）。
         {
@@ -455,6 +546,9 @@ impl Cluster {
     }
 
     /// 当前状态快照（用于 healthz）。
+    ///
+    /// `nats_connected` 是探针状态码的唯一依据：NATS 未连接时 `GET /healthz`
+    /// 返回 503，否则集群退化成单机也会被判成 healthy。
     pub fn status_snapshot(&self) -> ClusterStatus {
         let mut s = self.status.lock().clone();
         let reg = self.registry.lock();
@@ -464,6 +558,14 @@ impl Cluster {
         s.total_listeners = reg.total_listeners();
         s.heartbeat_seq = self.hb_seq.load(Ordering::SeqCst);
         s
+    }
+
+    /// 供测试与探针自测用：直接把 NATS 状态位打到指定值，不碰任何连接。
+    ///
+    /// 探针的状态码只来自 [`ClusterStatus::nats_connected`]，测这个映射不能
+    /// 依赖一台真的 NATS server。
+    pub fn mark_nats_connected(&self, connected: bool) {
+        self.bump_status(|s| s.nats_connected = connected);
     }
 
     /// 配置。
@@ -487,6 +589,20 @@ impl Cluster {
             dead_since_ms: None,
         };
         let _ = self.registry.lock().insert_node(node);
+    }
+
+    /// 重连后专用：只读扫一遍失联的远端节点，返回它们的 node_id。
+    ///
+    /// **只报告、不判死**：标记 `NodeStatus::Dead`、触发房间迁移、递增
+    /// `dead_nodes_detected` 都是 [`Cluster::health_check`] / `reap_dead` 的专职
+    /// 工作（迁移计数器与两段式交接的唯一入口）。这里不碰状态，避免重连路径
+    /// 和判死循环同时驱动迁移。
+    ///
+    /// [`Cluster::health_check`] 一次只能全做或全不做，而重连成功那一刻只想先
+    /// 知道「离线期间谁失联了」再把自己登记进注册表：否则这一轮的调度候选里
+    /// 会混着离线期的 stale 条目。真正的不可达节点由下一轮健康检查收敛。
+    fn reap_dead_remote(&self) -> Vec<String> {
+        self.registry.lock().reap_dead_remote(&self.cfg, unix_ms())
     }
 
     fn migration_destination(&self, exclude: &str, streams: u64, listeners: u64) -> Option<String> {

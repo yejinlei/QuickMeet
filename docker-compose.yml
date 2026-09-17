@@ -4,7 +4,9 @@
 # 因此本文件**不使用** compose 2.x / docker-compose-plugin 才有的语法：
 #   - 没有 deploy: 段（1.29.2 会直接拒绝）
 #   - 没有 YAML anchor / alias（v3.8 规范不支持）
-#   - 没有 extends: / develop: / secrets: / config:
+#   - 没有 extends: / develop: / config: / include:
+#     （extends/develop 任何层级都不支持；config/include 是 2.x 顶层语法。
+#       服务级 secrets: 在 1.29.2 是**合法**键，本文件只是没用到）
 #   - 没有 include:、没有多行 build.contexts、没有 build.target
 #   - 重启策略用服务级 restart:（v3 语法），不写在 deploy.restart_policy 里
 #   - build 用短语法，context 不越过仓库根目录
@@ -21,7 +23,7 @@
 # `command: [--bind, 0.0.0.0, --cluster]` 让 Docker 拿 "--bind" 当可执行文件
 # 去 exec，报 `exec: "--bind": executable file not found in $PATH`。
 #
-# ── 地址模型（本卡新增，容易写错）─────────────────────────────────
+# ── 地址模型（容易写错，改前先读这一段）──────────────────────────
 # 容器网络**不用** 192.168.0.0/24，保持 Docker 默认 bridge 子网。原因：
 # advertised_addr 必须同时被「内网里的浏览器」和「其他容器」访问到，
 # 在单机部署下只有**宿主机 IP + 端口映射**能同时满足两边。如果把容器
@@ -32,8 +34,14 @@
 # （宿主机内网 IP + 映射出的端口）。其他容器访问这个地址时会走宿主机的
 # Docker DNAT 绕一圈（hairpin），功能正确，只是多一跳，集群判活不受影响。
 #
+# **单机三节点的关键点**：三个节点跑在**同一台宿主机**上，所以三个
+# advertised_addr 的 IP 必须**都是同一个宿主机 LAN IP**，只有端口不同
+# （8080 / 8082 / 8083）。不要写 192.168.0.11 / 192.168.0.12 ——
+# 那两台机器不存在，节点 2/3 会对浏览器和旁听节点广播不可达地址，
+# 结果就是集群「看起来 3 节点」但实际互通失败。
+#
 # 现场改法：如果宿主机内网 IP 不是 192.168.0.10，把三个节点的
-# QM_CLUSTER_ADVERTISED_ADDR 的 IP 段改成宿主机实际 IP（端口保持不变）。
+# QM_CLUSTER_ADVERTISED_ADDR 的 IP 段**统一**改成宿主机实际 IP（端口保持不变）。
 #
 # ── 运行 ─────────────────────────────────────────────────────────
 #   docker-compose up -d --build        # 1.29.2 的 CLI，不是 docker compose
@@ -131,8 +139,12 @@ services:
   #
   # 健康探针：集群模式不监听 8081，没有 HTTP 端点可做探针，
   # 所以节点另起一个只读 /healthz（容器内固定 8090，宿主机暴露 8091）。
-  # interval 5s × retries 2 = 10s，与配置里的「判死窗口」heartbeat 5s ×
-  # misses 2 = 10s 对齐 —— 容器判死和集群判死用同一个口径。
+  # 探针在 NATS 未连接时返 503（curl -f 判失败），因此：
+  #   * start_period 90s —— 吸收 NATS 连接 + 成员心跳收敛的启动协调时间，
+  #     避免启动期被算成判死而触发重启风暴；
+  #   * interval 5s × retries 3 —— 稳态下的判死窗口（~10s），与配置里
+  #     heartbeat 5s × misses 2 = 10s 的集群判死口径对齐。
+  # 两个窗口**故意分开**：启动慢不是节点坏了。
   qm-media:
     build:
       context: .
@@ -150,6 +162,8 @@ services:
     env_file:
       - config/container.env
     # 节点身份：每个集群节点必须覆盖 node_id 与 advertised_addr。
+    # advertised_addr 的 IP 是宿主机 LAN IP（不是容器 IP），端口是本节点映射
+    # 出来的宿主机端口 —— 见文件头「地址模型」。
     # 探针端口由 container.env 的 QM_CLUSTER_HEALTH_PORT=8090 统一控制。
     environment:
       - QM_CLUSTER_NODE_ID=node-1
@@ -158,8 +172,8 @@ services:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8090/healthz"]
       interval: 5s
       timeout: 2s
-      retries: 2
-      start_period: 30s
+      retries: 3
+      start_period: 90s
     volumes:
       - meeting-data:/opt/quickmeet/data
       - meeting-logs:/opt/quickmeet/logs
@@ -186,15 +200,17 @@ services:
       - "8092:8090"   # 集群健康探针
     env_file:
       - config/container.env
+    # 单机三节点：IP 与 node-1 相同（同一台宿主机），只换映射端口。
+    # 写成 192.168.0.11 会是不可达地址 —— 那台机器不存在。
     environment:
       - QM_CLUSTER_NODE_ID=node-2
-      - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.11:8082
+      - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.10:8082
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8090/healthz"]
       interval: 5s
       timeout: 2s
-      retries: 2
-      start_period: 30s
+      retries: 3
+      start_period: 90s
     volumes:
       - meeting-data-2:/opt/quickmeet/data
       - meeting-logs:/opt/quickmeet/logs
@@ -223,13 +239,13 @@ services:
       - config/container.env
     environment:
       - QM_CLUSTER_NODE_ID=node-3
-      - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.12:8083
+      - QM_CLUSTER_ADVERTISED_ADDR=192.168.0.10:8083
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8090/healthz"]
       interval: 5s
       timeout: 2s
-      retries: 2
-      start_period: 30s
+      retries: 3
+      start_period: 90s
     volumes:
       - meeting-data-3:/opt/quickmeet/data
       - meeting-logs:/opt/quickmeet/logs

@@ -17,7 +17,8 @@
 #   5. qm-demo 默认命令 + 8080/8081 端口假设校验
 #   6. docker build（Dockerfile）
 #   7. docker-compose config（含 compose 1.29.2 语法兼容校验）
-#   8. docker-compose up -d --build + 四容器 healthcheck 全部 healthy + /healthz 探活
+#   8. docker-compose up -d --build + 五容器 healthcheck 全部 healthy
+#      + /healthz 探活 + 集群硬断言（nats_connected 且 cluster_nodes >= 3）
 #   9. 逐个 restart 服务，验证 restart: unless-stopped 自愈
 #  10. CI workflow 语义校验（YEJ-114 并入 QM-015，见 scripts/verify-workflows.sh）
 
@@ -155,20 +156,27 @@ if want 7; then
     skip "7. docker-compose config（docker-compose 不可用或 --no-docker）"
   else
     say "7. compose 1.29.2 语法兼容检查"
-    HIT=0
-    # compose 1.29.2 会直接拒绝的键。只列**确定**是 2.x 才有的顶层/服务级键：
-    #   deploy（compose file 场景）、extends、develop、secrets、config（顶层）、include。
-    # 刻意不查 ipam 的 `config`（1.29.2 支持 `networks.<n>.ipam.config`），
-    # 也不查 `target`（多阶段 build 的目标，1.29.2 支持）。
-    # 键必须出现在 4 空格缩进以内（服务级）—— 更深的缩进说明它是别的键的子项，不算命中。
-    grep -nE "^[[:space:]]*(deploy|extends|develop|secrets|include):[[:space:]]*" \
-      docker-compose.yml > "$REPO_ROOT/target/compose-2x.txt" 2>/dev/null && HIT=1
-    if [ "$HIT" -ne 0 ]; then
-      echo "   发现 2.x 专属键（compose 1.29.2 会拒绝）："
+    # compose 1.29.2 会直接拒绝的键，按「出现在哪一层」分成两个黑名单：
+    #   * 顶格（顶层）：deploy / extends / develop / secrets / config / include
+    #   * 服务级：extends / develop —— 这两个键 1.29.2 在任何层级都不支持。
+    # 服务级键只认 1~4 空格缩进：更深的缩进说明它是别的键的子项，不算命中。
+    # 注意 `secrets` **不能**进服务级黑名单：1.29.2 的服务级 `secrets:` 是合法键
+    # （配 `secrets.enabled: false` + 文件引用），列进去会把合法配置误报成硬失败。
+    # 同样刻意不查 ipam 的 `config`（1.29.2 支持 `networks.<n>.ipam.config`），
+    # 也不查 build 的 `target`（多阶段 build 的目标选择，1.29.2 支持）。
+    TOP2X=$(grep -nE '^(deploy|extends|develop|secrets|config|include):' \
+      docker-compose.yml 2>/dev/null)
+    SVC2X=$(grep -nE '^ {1,4}(extends|develop):' \
+      docker-compose.yml 2>/dev/null)
+    { [ -n "$TOP2X" ] && echo "$TOP2X"; [ -n "$SVC2X" ] && echo "$SVC2X"; } \
+      > "$REPO_ROOT/target/compose-2x.txt"
+    if [ -s "$REPO_ROOT/target/compose-2x.txt" ]; then
+      echo "   发现 1.29.2 不支持的键（顶层 2.x 专属 / 服务级 extends・develop）："
       cat "$REPO_ROOT/target/compose-2x.txt"
       fail "7a. compose 1.29.2 语法检查"
     else
-      echo "   未发现 deploy:/extends/develop/secrets/include（ipam.config 属 1.29.2 合法键）"
+      echo "   未发现顶层 deploy/extends/develop/secrets/config/include，也未发现服务级 extends/develop"
+      echo "   （服务级 secrets 属 1.29.2 合法键，不列入黑名单；ipam.config / build.target 同）"
       ok "7a. compose 1.29.2 语法检查"
     fi
     step "7b. docker-compose config" docker-compose -f "$REPO_ROOT/docker-compose.yml" config
@@ -178,14 +186,17 @@ fi
 # ── 8. up + 健康检查 + 探活端点 ─────────────────────────────────
 if want 8; then
   if [ "$NO_DOCKER" = 1 ] || ! have docker-compose; then
-    skip "8. 四容器健康检查（docker-compose 不可用或 --no-docker）"
+    skip "8. 五容器健康检查（docker-compose 不可用或 --no-docker）"
   else
     say "8. docker-compose up -d --build + 健康检查"
     docker-compose down -v --remove-orphans >/dev/null 2>&1
     if ! docker-compose up -d --build; then
       fail "8. docker-compose up"
     else
-      # start_period 30s + interval 5s × retries 2 = 45s 判死窗口；给 240s 余量。
+      # start_period 90s + interval 5s × retries 3 = 130s 判死窗口；给 240s 余量。
+      # start_period 必须**长于**集群协调时间（NATS 连接 + 成员心跳收敛）：探针在
+      # NATS 未连接时返回 503，start_period 太短的话启动期的协调延迟会被算进判死
+      # 窗口、触发容器重启风暴 —— 这正是把「启动窗口」与「判死窗口」解耦。
       echo "   等待 qm-nats/qm-media/qm-media-2/qm-media-3/qm-signaling 全部 healthy"
       ALL_OK=0
       for i in $(seq 1 60); do
@@ -210,8 +221,25 @@ if want 8; then
           [ "$code" = "200" ] || EP_OK=0
         done
         [ "$EP_OK" = 1 ] && ok "8b. /healthz 探活端点全部 200" || fail "8b. /healthz 探活端点"
+
+        # 8c 是硬判据：探针 200 只证明进程活着，不证明集群活着。NATS 挂了时三个
+        # 节点全退化成单机、`docker ps` 照样全 healthy —— 只比 8a/8b 等于把 QM-006
+        # 的集群验收一起掩盖掉。所以必须逐个节点断言 JSON 里 nats_connected == true
+        # 且 cluster_nodes >= 3（不依赖 jq，用 sed 抽取）。
+        CL_OK=1
+        for p in 8091 8092 8093; do
+          body=$(curl -s -m 3 "http://127.0.0.1:$p/healthz" || echo "")
+          nc=$(printf '%s' "$body" | sed -n 's/.*"nats_connected"[: ]*\(true\|false\).*/\1/p')
+          nodes=$(printf '%s' "$body" | sed -n 's/.*"cluster_nodes"[: ]*\([0-9][0-9]*\).*/\1/p')
+          echo "   节点 :$p -> nats_connected=${nc:-none} cluster_nodes=${nodes:-none}"
+          [ "$nc" = "true" ] || CL_OK=0
+          [ "${nodes:-0}" -ge 3 ] 2>/dev/null || CL_OK=0
+        done
+        [ "$CL_OK" = 1 ] \
+          && ok "8c. 三节点均已入集群（nats_connected 且 cluster_nodes >= 3）" \
+          || fail "8c. 集群未真正形成（存在退化单机的节点）"
       else
-        skip "8b. /healthz 探活（curl 不可用）"
+        skip "8b/8c. /healthz 探活与集群断言（curl 不可用）"
       fi
     fi
   fi
@@ -226,9 +254,15 @@ if want 9; then
     OK_ALL=1
     for svc in qm-nats qm-media qm-media-2 qm-media-3 qm-signaling; do
       docker restart "$svc" >/dev/null 2>&1 || OK_ALL=0
-      sleep 6
-      st=$(docker inspect --format '{{.State.Health.Status}}' "$svc" 2>/dev/null)
-      echo "   $svc -> ${st:-no-healthcheck}"
+      # start_period 90s 期间状态是 starting，不算 unhealthy 也不算 healthy：
+      # 必须轮询等它真正收敛，而不是重启后 sleep 6 秒只看一次。
+      st=""
+      for i in $(seq 1 24); do
+        sleep 5
+        st=$(docker inspect --format '{{.State.Health.Status}}' "$svc" 2>/dev/null)
+        [ "$st" = "healthy" ] && break
+      done
+      echo "   $svc -> ${st:-no-healthcheck}（等 $((i * 5))s）"
       [ "$st" = "healthy" ] || OK_ALL=0
     done
     [ "$OK_ALL" = 1 ] && ok "9. 重启自愈" || fail "9. 重启自愈"

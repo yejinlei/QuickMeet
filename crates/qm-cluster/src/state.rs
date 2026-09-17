@@ -398,6 +398,34 @@ impl Registry {
         changed
     }
 
+    /// 只读地列出「已失联但还没被判死」的**远端**节点，不修改任何状态。
+    ///
+    /// 判死（标记 `NodeStatus::Dead`、触发两阶段房间迁移、递增
+    /// `dead_nodes_detected`）全部由 [`Registry::reap_dead`] 负责——它是这些
+    /// 副作用的唯一入口，避免重连路径与判死循环同时驱动迁移。
+    ///
+    /// NATS 重连成功那一刻用它先扫一遍：注册表里可能还躺着离线期间的 stale
+    /// 条目，直接把自己插进去会让这一轮调度决策被残留数据污染。真正的判死与
+    /// 迁移仍等下一轮 `reap_dead` 收敛，无需人为重启整个集群。
+    ///
+    /// 返回的 id 不含自身（自己失联不算远端失联），也不含已经是 `Dead` 的节点。
+    pub fn reap_dead_remote(&mut self, cfg: &ClusterConfig, now_ms: u64) -> Vec<String> {
+        let window = Self::health_window(cfg);
+        let mut dead = Vec::new();
+        for node in self.nodes.values() {
+            if node.node_id == self.node_id {
+                continue; // 自己不算失联
+            }
+            if node.status == NodeStatus::Dead {
+                continue;
+            }
+            if node.last_seen_ms.saturating_add(window) < now_ms {
+                dead.push(node.node_id.clone());
+            }
+        }
+        dead
+    }
+
     /// 检查所有节点是否应该判死；返回新判死的节点 id 列表（用于触发迁移）。
     pub fn reap_dead(&mut self, cfg: &ClusterConfig, now_ms: u64) -> Vec<String> {
         let window = Self::health_window(cfg);

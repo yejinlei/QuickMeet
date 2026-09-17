@@ -37,7 +37,9 @@ pub const DEFAULT_HEALTH_PORT: u16 = 8090;
 /// 4. 阻塞到 Ctrl+C，然后正常退出（容器收到 `docker stop` 的 SIGTERM 时同样退出）。
 ///
 /// NATS 不可达时**不返回错误**：节点退化为单机模式继续运行，
-/// 下一跳心跳重试连接。这是「节点动态增减、无需重启整体服务」的前提。
+/// 后台起一个带退避的 NATS 重连循环（[`Cluster::nats_supervisor`]），
+/// 回恢后自动重入集群、无需人工重启容器。这是「节点动态增减
+/// 、无需重启整体服务」的前提。
 ///
 /// 只有配置非法、runtime 创建失败这类硬错误会返回 `Err` —— 配置问题必须
 /// fail fast，不能带着非法配置进集群。
@@ -108,9 +110,15 @@ pub fn health_addr(cfg: &qm_common::AppConfig) -> SocketAddr {
 /// 集群主循环自己等 Ctrl+C，这样不会注册两个 `ctrl_c` 接收端 ——
 /// 第一个消费掉信号后，第二个永远不会再触发，进程就退不出去了。
 ///
-/// * `GET /healthz` → `200` + JSON（`status` / `node_id` / `nats_connected` / 集群规模等）；
+/// * `GET /healthz` → 存活 `200`，**NATS 未连接时返回 `503`** + JSON
+///   （`status` / `node_id` / `nats_connected` / 集群规模等）；
 /// * `POST /healthz` → `202`（让 `curl -X POST -s -o /dev/null` 形式的探针也能判活）；
 /// * 其它方法 → `405`，其它路径 → `404`。
+///
+/// NATS 状态必须进状态码，不能只进 JSON：`curl -fsS` 形式的 healthcheck 只看
+/// 4xx/5xx，只看 JSON 的话 NATS 挂了、集群退化成单机时容器照样报 `healthy`，
+/// 验收就变成假通过。代价是 NATS 抖动期间节点会被判 unhealthy，因此 compose 侧
+/// 把 `start_period` 拉长以吸收启动期的协调延迟（判死窗口与启动窗口解耦）。
 ///
 /// 绑定失败返回 `None` 并 `warn!`：探针起不来不应阻止节点入集群
 /// （节点仍能调度与迁移），只是容器健康检查会报不健康。
@@ -164,7 +172,7 @@ pub async fn handle_health_req(
         Method::GET => {
             let s = cluster.status_snapshot();
             let body = serde_json::json!({
-                "status": "ok",
+                "status": if s.nats_connected { "ok" } else { "degraded" },
                 "service": "qm-cluster",
                 "node_id": s.node_id,
                 "role": s.role,
@@ -181,7 +189,14 @@ pub async fn handle_health_req(
                 "migrations_failed": s.migrations_failed,
                 "version": crate::VERSION,
             });
-            Ok(json_resp(StatusCode::OK, body.to_string()))
+            let status = if s.nats_connected {
+                StatusCode::OK
+            } else {
+                // 503 而不是 200：healthcheck 用 `curl -f` 只判 4xx/5xx，NATS 未连接
+                // 必须进状态码，否则集群退化成单机时容器照样报 healthy。
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            Ok(json_resp(status, body.to_string()))
         }
         Method::POST => {
             // 消费掉请求体，避免探活侧连接未正常结束而报 broken pipe。
@@ -297,7 +312,10 @@ mod tests {
         assert_eq!(health_addr(&cfg).port(), 9090);
     }
 
-    /// GET /healthz → 200 + JSON，且带 nats_connected / version 字段。
+    /// GET /healthz → 503（NATS 未连接时），且带 nats_connected / version 字段。
+    ///
+    /// 状态码必须反映 NATS 状态：healthcheck 用 `curl -f` 只看 4xx/5xx，
+    /// NATS 挂了还返 200 就是「集群退化单机但五容器全报 healthy」的假通过。
     #[tokio::test]
     async fn healthz_get_returns_ok_json() {
         let cluster = Arc::new(Cluster::default());
@@ -307,12 +325,36 @@ mod tests {
             .body(hyper::Body::empty())
             .unwrap();
         let resp = handle_health_req(cluster, req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NATS 未连接时 GET /healthz 必须返 503"
+        );
         let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let body = String::from_utf8_lossy(&bytes).into_owned();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["nats_connected"], false);
+        assert_eq!(v["version"], crate::VERSION);
+    }
+
+    /// GET /healthz → 200（NATS 已连接时），正常路径的断言不能丢。
+    #[tokio::test]
+    async fn healthz_get_returns_ok_when_nats_connected() {
+        let cluster = Arc::new(Cluster::default());
+        cluster.mark_nats_connected(true);
+        let req = Request::builder()
+            .method(http::Method::GET)
+            .uri("/healthz")
+            .body(hyper::Body::empty())
+            .unwrap();
+        let resp = handle_health_req(cluster, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
         assert_eq!(v["status"], "ok");
-        assert!(v["nats_connected"].is_boolean());
+        assert_eq!(v["nats_connected"], true);
         assert_eq!(v["version"], crate::VERSION);
     }
 
@@ -450,6 +492,8 @@ mod tests {
         std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
         let addr: SocketAddr = "127.0.0.1:48090".parse().unwrap();
         let cluster = Arc::new(Cluster::default());
+        // 探针只有 NATS 已连接时才返 2xx，这里先打上标再验监听路径。
+        cluster.mark_nats_connected(true);
         let h = serve_health(cluster.clone(), addr)
             .await
             .expect("测试端口必须可绑定");
@@ -484,7 +528,9 @@ mod tests {
         std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
         let addr: SocketAddr = "127.0.0.1:48091".parse().unwrap();
 
-        let h = serve_health(Arc::new(Cluster::default()), addr)
+        let cluster = Arc::new(Cluster::default());
+        cluster.mark_nats_connected(true);
+        let h = serve_health(cluster, addr)
             .await
             .expect("测试端口必须可绑定");
         assert!(

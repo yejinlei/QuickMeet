@@ -13,10 +13,13 @@
 #                         job id 是否含点号、name 是否被当成 inline mapping、
 #                         uses: 是否只用公开仓库且固定 ref、timeout 是否超 15 分钟。
 #                         跑 `scripts/verify-workflows.sh`，与本地预检是同一份脚本，
-#                         不依赖任何第三方 action。
+#                         不依赖任何第三方 action。末尾追加一个非阻塞的第三方
+#                         action-validator 作为交叉校验，详见该 job 的注释。
 #
 # 约束（Issue QM-018 强制约束）：
-#   * 不依赖任何私有凭据：全部工件来自 crates.io / docker hub / GitHub 官方 release。
+#   * 不依赖任何私有凭据：全部工件来自 crates.io / docker hub / 公开 GitHub
+#     release（rust / docker / action-validator）。唯一引入的第三方 action 是
+#     `mpalmer/action-validator`，仅用于 workflow-lint 的非阻塞交叉校验。
 #   * 不接入需要公网账户或第三方 SaaS 的监控/构建服务（GitHub Actions 自身除外）。
 #   * compose 语法必须兼容 docker-compose 1.29.2 —— 用真实 1.29.2 二进制校验，
 #     而不是靠 `docker compose config`（那只能验证 2.x 语法）。
@@ -129,6 +132,15 @@ jobs:
       - name: verify 步骤 6（docker build）
         run: STEPS=6 bash scripts/verify.sh --no-docker
 
+      # NATS 镜像 tag 必须真实存在：1.29.2 拉不到镜像会一直卡在拉取阶段，
+      # 表现为「五容器起不来」而不是明确的报错。这里提前 pull 一次，
+      # 让失败发生在能看出是哪一层的问题时（也同时预热镜像缓存）。
+      - name: 确认 NATS 镜像 tag 存在（nats:2.10.21-alpine）
+        run: |
+          docker pull nats:2.10.21-alpine
+          docker image inspect nats:2.10.21-alpine \
+            --format 'nats 镜像已就绪：ID={{.Id}} 大小={{.Size}}'
+
       - name: verify 步骤 7-9（compose 语法 / up + 健康检查 / 重启自愈）
         run: STEPS="7 8 9" bash scripts/verify.sh
 
@@ -209,7 +221,8 @@ jobs:
   # ── Job 5：workflow 自身校验（YEJ-114 并入 QM-015）──────────────
   # 放在最后一个 job：它校验**包括自己在内**的所有 workflow。
   # 跑的是 `scripts/verify-workflows.sh`，与本地预检同一份脚本，
-  # 不依赖任何第三方 action（满足「无私有依赖」约束）。
+  # 硬门禁不依赖任何第三方 action（满足「无私有依赖」约束）；
+  # 末尾那个第三方 action-validator 只是非阻塞的交叉校验。
   #
   # 为什么值得单独一个 job：YAML 1.1 会静默改语义，肉眼 diff 看不出来，
   # 而这类错误的表现是「CI 静默不跑」而不是「语法报错」，极难定位。
@@ -231,3 +244,25 @@ jobs:
 
       - name: workflow 预检（含 7 个反例自证）
         run: bash scripts/verify-workflows.sh
+
+      # 通用 workflow 校验器作为**补充**信号，不替代上面的自研校验：
+      #   * 自研脚本查的是「YAML 解析会悄悄改语义」这类 GitHub 平台特有坑
+      #     （on 被吞成 bool、job id 带点、name 变 inline mapping、uses 没固定
+      #     ref），这些是 workflow 能不能被 Actions 接住的问题，通用校验器管不到；
+      #   * 校验器能覆盖 schema 层面的漂移（写错的 key 名、非法 runner label、
+      #     表达式类型不匹配），作为交叉验证有价值，所以追加而不是替换。
+      #
+      # **它不叫 `actions/action-validator`。** 那个 ref 在 GitHub 上不存在
+      # （`GET /repos/actions/action-validator` 返回 404，同批 `actions/checkout`
+      # 等对照仓库返回 200，排除限流误判）；`action-validator` 这个名字的真实
+      # 归属是 `mpalmer/action-validator`，本步骤用的是它的最新 tag `v0.9.0`。
+      # 它默认扫 `.github/workflows/*.yml*`，不用配 patterns；内部用
+      # `gh release download` 拉二进制，需要 `contents: read`（文件顶部已给）。
+      #
+      # 但**不阻塞** job（continue-on-error）：这是第三方 action，不是 GitHub
+      # 官方出品，它每次都要在 CI 上现下载一个二进制 —— 把它设成硬门禁的风险
+      # 是上游一动就红，而它带来的增量收益远小于自研校验。真出问题时日志里
+      # 能看到失败输出，人工确认契约没变之后再考虑去掉这一行。
+      - name: action-validator 补充校验（mpalmer/action-validator，非阻塞）
+        continue-on-error: true
+        uses: mpalmer/action-validator@v0.9.0

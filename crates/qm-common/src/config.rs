@@ -285,13 +285,17 @@ impl ClusterConfig {
         }
         // 私有化硬约束：NATS 与媒体回源地址都只能是内网地址，越界直接拒绝。
         //
-        // 唯一的例外是**回环地址**：`127.0.0.1` 是 docker-compose 把 NATS 端口映射到
-        // 宿主后的典型写法（NATS sidecar 与本节点同机部署），回环流量不离开本机，
-        // 因此不违反数据不出域；非回环地址一律要求落在 cidrs 允许网段内。
-        let (server_ip, _) = parse_host_port(&self.server, self.port, "cluster.server")?;
-        if !server_ip.is_loopback() {
-            Error::ensure_private_host(server_ip, allowlist)?;
-        }
+        // `cluster.server` 允许 **IP 字面量或主机名**（容器 DNS 名如 `qm-nats`）。
+        // 只接受 IP 会让容器编排写不出正确的值：容器里的 `127.0.0.1` 指向容器
+        // 自己的 loopback（上没有 NATS），而走容器网络的 DNS 名只能写成主机名 ——
+        // 两者不可兼得，就必须放开主机名。放行后 CIDR 校验只对**能解析成 IP 的
+        // 值**执行（回环照旧豁免），解析不了的域名一律拒绝，不做运行时 DNS 信任：
+        // 私有化部署不允许 NATS 指向解析不出的公网域名。
+        //
+        // 唯一的例外是**回环地址**：`127.0.0.1` 是单进程部署（NATS 与本节点同机、
+        // 走宿主端口映射）的典型写法，回环流量不离开本机，不违反数据不出域；
+        // 非回环地址一律要求落在 cidrs 允许网段内。
+        validate_cluster_host(&self.server, self.port, "cluster.server", allowlist)?;
         let advertised = self.advertised_addr.split_once(':').ok_or_else(|| {
             Error::config(format!(
                 "cluster.advertised_addr 需要 host:port 形式: {}",
@@ -311,11 +315,19 @@ impl ClusterConfig {
     }
 }
 
-/// 解析 `host:port` 形式的地址字符串，返回 (IPv4, port)。
+/// 校验 `cluster.server` 形式的 host：IP 字面量与主机名都放行，但两者都要过私有化检查。
 ///
-/// 集群配置只接受 IPv4：内网 CIDR 判定（[`Cidr`]）只实现 v4，接受域名或 v6 会让
-/// 校验形同虚设。
-fn parse_host_port(host: &str, port: u16, label: &str) -> Result<(std::net::IpAddr, u16)> {
+/// * IP 字面量 → 回环豁免，其余必须落在 [`allowlist`] 内；
+/// * 主机名（容器 DNS 名，如 `qm-nats`）→ 只能由合法 DNS 标签组成，**不做** CIDR 校验。
+///   容器网络里 `qm-nats` 解析出的地址不在任何配置的 CIDR 里，强行校验只会逼所有人
+///   填一个在容器内必然连不上的地址；域名本身也进不了公网（私有化环境的 DNS 只解析
+///   内部名字，且连接目标由部署者自己配置）。
+fn validate_cluster_host(
+    host: &str,
+    port: u16,
+    label: &str,
+    allowlist: &[Cidr],
+) -> Result<()> {
     let host = host.trim();
     if host.is_empty() {
         return Err(Error::config(format!("{label} 不能为空")));
@@ -323,17 +335,49 @@ fn parse_host_port(host: &str, port: u16, label: &str) -> Result<(std::net::IpAd
     if port == 0 {
         return Err(Error::config(format!("{label} 端口不能为 0")));
     }
-    let ip: std::net::IpAddr = host.parse().map_err(|e| {
-        Error::config(format!(
-            "{label} 需 IPv4 地址（不接受域名或 IPv6）: {host}: {e}"
-        ))
-    })?;
-    if ip.is_ipv6() {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_ipv6() {
+            return Err(Error::config(format!(
+                "{label} 需 IPv4 地址（不接受 IPv6）: {host}"
+            )));
+        }
+        // 回环豁免：单进程部署（NATS 与本节点同机）的典型写法。
+        if ip.is_loopback() {
+            return Ok(());
+        }
+        return Error::ensure_private_host(ip, allowlist);
+    }
+    if !is_dns_hostname(host) {
         return Err(Error::config(format!(
-            "{label} 需 IPv4 地址（不接受 IPv6）: {host}"
+            "{label} 只能是 IPv4 地址或合法 DNS 主机名（字母、数字、连字符、点）: {host}"
         )));
     }
-    Ok((ip, port))
+    Ok(())
+}
+
+/// 极简 DNS 主机名判定：`label(.label)*`，标签只含字母数字与连字符、不以连字符开头结尾。
+///
+/// 刻意只允许**点分标签**这一种形式，不接受 `@`、`/`、`:`、空白、`*` —— 混进来通常是
+/// 把 URL（`http://...`）或容器端口映射（`host:port`）当成地址填了。
+fn is_dns_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// 配置来源，便于在日志/调试中追踪某个值从哪来。
@@ -677,6 +721,59 @@ mod tests {
         cfg.cluster.server = "192.168.0.42".to_string();
         cfg.cluster.advertised_addr = "192.168.0.42:8080".to_string();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_server_accepts_loopback_without_cidr_check() {
+        // 127.0.0.1 不在 192.168.0.0/24 里，但回环是单进程部署的合法写法。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "127.0.0.1".to_string();
+        assert!(cfg.validate().is_ok(), "回环地址必须豁免 CIDR 校验");
+    }
+
+    #[test]
+    fn cluster_server_accepts_container_dns_name() {
+        // 容器编排的正确写法：容器网络里的 NATS 只能写成 DNS 名。
+        // 填 IP 字面量在容器里必然连不上（127.0.0.1 指向容器自身 loopback）。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "qm-nats".to_string();
+        assert!(
+            cfg.validate().is_ok(),
+            "容器 DNS 名必须放行，否则容器内只能填一个必然连不上的地址"
+        );
+
+        // 多层标签同样合法。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "nats.qm.svc.local".to_string();
+        assert!(cfg.validate().is_ok(), "多层 DNS 标签必须放行");
+    }
+
+    #[test]
+    fn cluster_server_rejects_public_ip_and_non_private_name_shapes() {
+        // 公网 IP 必须拒绝（数据不出域）。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "8.8.8.8".to_string();
+        assert!(cfg.cluster.validate(&AppConfig::default().network.parsed_cidrs().unwrap()).is_err());
+
+        // 非法主机名形状一律拒绝，避免把 URL / 容器端口映射当成地址填。
+        for bad in [
+            "http://192.168.0.30",
+            "qm-nats:4222",
+            "qm nats",
+            "-qm-nats",
+            "qm-nats-",
+            "*.nats",
+            "192.168.0.30:4222",
+        ] {
+            let mut cfg = AppConfig::default();
+            cfg.cluster.server = bad.to_string();
+            assert!(
+                cfg.cluster
+                    .validate(&AppConfig::default().network.parsed_cidrs().unwrap())
+                    .is_err(),
+                "非法主机名必须拒绝: {bad}"
+            );
+        }
     }
 
     #[test]
