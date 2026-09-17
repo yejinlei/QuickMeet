@@ -123,6 +123,31 @@ NATS 只投递给队列里的一个节点，由它回包。请求方用 `request
 默认值直接对齐验收标准 2：节点连续错过 2 次心跳（10 秒）即判死，
 随后开始迁移它名下的房间。
 
+**「10s 宕机迁移」的起点是判死时刻，不是进程死亡时刻。** `failover_target_secs`
+是「判死之后的迁移时限」，判死之前集群不可能知道节点已经没了，那一段属于判死窗口。
+默认配置下的端到端口径是：
+
+```
+判死窗口 10s + 迁移时限 10s = 「进程死亡 → 归属变更」最坏 20s
+```
+
+要收紧端到端时限就缩判死窗口（两个旋钮同时动，见 §4 配置速查），
+别只调 `failover_target_secs` —— 那只会收紧迁移段，判死段一分不减。
+
+**窗口单位是毫秒，不要手抄这个公式。** `Registry::health_window()` 返回
+`heartbeat_secs × unhealthy_misses × 1000` —— `last_seen_ms` 是 Unix 毫秒，
+判死逻辑拿这个值和 `now_ms` 直接比较。少乘 1000 时窗口只有 10 毫秒，
+健康检查的每一个轮次都会把全部节点判死、再被下一轮心跳复活：集群永久抖动，
+`Router::migration_destination` 因为 `is_schedulable()` 恒为 false 永远选不到
+候选节点，故障迁移实际上完全失效（2026-09 实测复现，见 `reap_dead_uses_a_healthy_window_not_a_two_millisecond_window`）。
+同理 `failover_target_secs` 是秒，参与宽限期计算时也要换成毫秒。
+
+**窗口必须明显大于「心跳周期 + 一次轮次延迟」。** 心跳和健康检查都是每
+`heartbeat_secs` 一轮的异步循环，两者周期接近时，一条刚发的心跳可能还没被接收端
+处理，健康检查就先跑了 —— 于是「1s 前刚活着的节点」看起来像「1s 没心跳」。
+窗口取 2s 配 1s 心跳时，真实运行会周期性地误判（健康节点成组 Dead、下一秒自己复活）；
+窗口取 5s 之后心跳始终新鲜，误判才消失。
+
 心跳发送后**立即 flush**，确认消息已到 server。这一步看起来多余，
 但它是故障检测正确性的前提：只有「最后一次心跳确实送达」，
 节点掉线才会被正确判死，而不是被当成「网络抖动」。
@@ -152,7 +177,8 @@ NATS 只投递给队列里的一个节点，由它回包。请求方用 `request
    队列会让任意节点抢走这条消息然后被直接忽略。
 2. **故障节点无法发起迁移，所以每个存活节点各自本地判断。**
    节点 X 崩溃后它自己不可能发任何东西，必须靠其他节点发现「X 名下的房间
-   还没人接」并接手。判死窗口 + 迁移窗口合计约 10s，落在验收标准 2 内。
+   还没人接」并接手。默认配置下判死窗口 10s + 迁移时限 10s = 端到端最坏 20s
+   （§1.5 的口径）。
 
 ### 1.6 旁听容量
 
@@ -228,8 +254,8 @@ config/default.toml  →  config/local.json  →  环境变量 QM_SECTION_FIELD
 | `advertised_addr` | `192.168.0.10:8080` | 对外媒体地址 |
 | `node_role` | `full` | `full` 全功能 / `listener` 旁听分发 |
 | `heartbeat_secs` | `5` | 心跳间隔 |
-| `unhealthy_misses` | `2` | 错过几次判死（窗口 = 5×2 = 10s） |
-| `failover_target_secs` | `10` | 故障后迁移完成时限 |
+| `unhealthy_misses` | `2` | 错过几次判死（判死窗口 = 5×2 = 10s，SLO 起点） |
+| `failover_target_secs` | `10` | **判死之后**的迁移完成时限；不是进程死亡之后 |
 | `join_target_secs` | `30` | 新节点接入时限 |
 | `request_timeout_secs` | `3` | 请求超时，必须小于 `heartbeat_secs` |
 | `max_rooms_per_node` | `64` | 单节点会议数硬上限 |
@@ -385,18 +411,22 @@ docker volume rm quickmeet_meeting-data-3   # 需要时
 # 造一个故障节点
 docker-compose kill -s KILL qm-media-3
 
-# 观察迁移：其余节点应在 ~10s 内判死 node-3 并迁移其房间
+# 观察迁移：其余节点应在 ~10s 判死 node-3，判死后 10s 内完成迁移
 docker-compose logs -f qm-media qm-media-2 | grep -E "节点故障|触发故障迁移|已承接迁移"
 ```
 
-时间线（默认配置）：
+时间线（默认配置，SLO 起点是判死时刻而不是杀进程时刻）：
 
 ```
-t=0s     node-3 停止心跳
-t=0-5s   第 1 次心跳错过（窗口未耗尽）
-t=10s    第 2 次心跳错过 → 判死，开始迁移
-t≤10s    迁移完成，房间归属到负载最低的健康节点
+t=0s     node-3 进程停止心跳（t0，验收标准 2 的「宕机」时刻）
+t=0-5s   第 1 次心跳错过（判死窗口未耗尽，集群尚不知其已死）
+t≈10s    第 2 次心跳错过 → 判死（SLO 起点）
+t≤20s    迁移完成，房间归属到负载最低的健康节点
+         最坏 20s = 判死窗口 10s + 迁移时限 10s
 ```
+
+实测（`qm-demo --repro --repro-profile production`，与 `default.toml` 同参数）：
+杀进程后 9915ms 判死、判死同轮即完成迁移（迁移段 0ms），端到端 9915ms。
 
 单节点故障不影响其他节点的会议：房间归属是 per-room 的，
 判死 node-3 只动 node-3 名下的房间，node-1 / node-2 的会议完全不受影响。
@@ -410,7 +440,7 @@ t≤10s    迁移完成，房间归属到负载最低的健康节点
 | 3 节点集群 | `docker-compose up -d --build`（已内置） |
 | 加媒体节点 | 复制一个 `qm-media-*` 服务，改 `node_id` / `advertised_addr` / 端口 |
 | 加旁听节点 | 加 `QM_CLUSTER_NODE_ROLE=listener` |
-| 缩短故障恢复时间 | 调小 `QM_CLUSTER_HEARTBEAT_SECS`（如 3）并同步调小 `REQUEST_TIMEOUT_SECS` |
+| 缩短端到端恢复时间 | 两个旋钮同时动：调小 `QM_CLUSTER_HEARTBEAT_SECS`（如 3）与 `QM_CLUSTER_UNHEALTHY_MISSES`（如 1）缩判死窗口，并同步调小 `QM_CLUSTER_REQUEST_TIMEOUT_SECS`（必须仍小于心跳间隔）。只调 `QM_CLUSTER_FAILOVER_TARGET_SECS` 只收紧迁移段，判死段一分不减 |
 | 提高单节点会议上限 | `QM_CLUSTER_MAX_ROOMS_PER_NODE=128` |
 | 提高旁听容量 | `QM_CLUSTER_LISTENER_CAPACITY` × `QM_CLUSTER_LISTENER_FANOUT` |
 | 切换 NATS 地址 | `QM_CLUSTER_SERVER=<内网 IPv4>`（容器内用容器名） |
@@ -423,9 +453,9 @@ t≤10s    迁移完成，房间归属到负载最低的健康节点
 调度、健康判定、迁移目标选择都是纯函数，不需要 NATS 就能单测：
 
 ```bash
-cargo test -p qm-cluster          # 34 个单测：subject 规划、调度、异构容量、判死、迁移目标、收敛、进程入口
-cargo test -p qm-common           # 28 个单测：含 cluster 配置校验与合规拒绝
-cargo test --workspace            # 全量 182 个测试
+cargo test -p qm-cluster          # 57 个单测：subject 规划、调度、异构容量、判死、迁移目标、收敛、进程入口
+cargo test -p qm-common           # 30 个单测：含 cluster 配置校验与合规拒绝
+cargo test --workspace            # 全量 209 个测试
 ```
 
 已覆盖的验收逻辑：
@@ -433,7 +463,7 @@ cargo test --workspace            # 全量 182 个测试
 | 验收标准 | 测试 |
 | --- | --- |
 | 1. 3 节点部署，会议分配到不同节点 | `assign_returns_none_when_no_candidates`、`assign_tie_break_is_deterministic`、`node_load_uses_the_node_own_capacity_not_local_config`、`assign_picks_the_big_node_over_a_saturated_small_node`（异构集群按节点自声明容量计分） |
-| 2. 节点宕机 10s 内迁移 | `cluster_defaults_satisfy_acceptance_windows`（判死窗口 = 5×2 = 10s） |
+| 2. 节点宕机 10s 内迁移 | `cluster_defaults_satisfy_acceptance_windows`（判死窗口 = 5×2 = 10s，即 SLO 起点；迁移时限 `failover_target_secs = 10s` 从判死时刻起算，端到端最坏 20s，见 §1.5 口径） |
 | 3. ≥10000 人旁听容量 | `cluster_defaults_satisfy_acceptance_windows`（200×20000 = 400 万槽位） |
 | 4. 30s 内接入 | `cluster_defaults_satisfy_acceptance_windows`（join_target_secs = 30） |
 | 全局约束 1/3/5 | `cluster_validate_rejects_public_addresses`、`cluster_validate_rejects_request_timeout_not_under_heartbeat` |
@@ -490,21 +520,31 @@ NATS 是单点（无 JetStream 持久化）。宕机期间：
 
 1. **NATS 是单点。** 未做 NATS server 集群（`-c` 组网）。
    私有化 3 节点规模下可接受；生产环境建议在 NATS 层做高可用。
-2. **`join_target_secs` 目前是配置项而非硬超时。** 代码保证新节点上线后立即
-   可被调度（连接 NATS + 拉快照后），30s 是验收时限口径，不是强制拦截。
+2. **`join_target_secs` 是收敛 SLO，不是调度闸门。** 它有实际含义：连接
+   NATS 到首个对端心跳超过该值会 `warn`（`heartbeat_recv_loop`），也是断线兜底
+   强制重连的时限（`connect_loop`）；但它不阻止新节点被调度。代码保证新节点
+   上线后立即可被调度（连接 NATS + 拉快照后），30s 是验收时限口径，不是强制拦截。
 3. **故障迁移是请求/回复，非推送。** 故障节点无法主动发起迁移，
    靠每个存活节点各自本地判断并驱动，因此迁移发起方可能不止一个。
    `RoomState.revision` 单调递增保证了重复迁移请求不会产生双归属 ——
    后到的同房间状态会收敛，但会产生一次多余的迁移尝试。
 4. **媒体容量折算基于 `listener_fanout` 的经验系数。** 实际瓶颈是媒体节点的
    CPU / 带宽，建议在真实 10000 人旁听场景中校准该系数。
-5. **本开发机没有 `nats-server` 也没有 Docker，无法在本地跑通 3 节点集成测试，
-   也无法验证 docker-compose 1.29.2 的运行时行为。** 调度/健康/迁移逻辑
-   已用纯函数单测覆盖（`cargo test --workspace` 182 个测试全绿），
-   但以下三项**必须**在部署环境实测，本 Issue 无法自证：
-   * 验收标准 1 的多节点分配（§3.1）；
-   * 验收标准 2 的 10s 内迁移（§3.5 故障演练）；
-   * 验收标准 4 的 30s 接入（§3.1 第 3 步）。
+5. **多节点集成测试必须在有 NATS 的环境跑。** 本机单测只能覆盖纯函数
+   （调度/判死/迁移目标/收敛，`cargo test --workspace` 209 个测试全绿）。
+   真集群行为由 `qm-demo --repro` 复现工具覆盖（`--features repro`，自带拉起
+   本地 NATS 2.10.21 + 3 节点 + 1 个可被杀掉的受害者子进程，产出 JSON 报告）：
+   * 验收标准 1 的多节点分配（§3.1）→ 断言 2，实测 6 次会议均匀落到 2 个节点；
+   * 验收标准 4 的 30s 接入（§3.1 第 3 步）→ 断言 1，实测收敛 2.0–5.1s；
+   * 验收标准 2 的 10s 迁移（§3.5 故障演练）→ 断言 5，报告里区分三个数：
+     `failover_detect_ms`（杀进程→判死）、`failover_ms`（判死→归属变更，即
+     SLO）、`failover_ms_from_kill`（端到端）。
+   复现配置有两档，且两档都先过 `AppConfig::validate()` + 真实 `load_from`
+   才算证据（配置无法被产品自己加载时，数字不成立）：
+   * `--repro-profile production`（默认 `default.toml` 参数：5s×2=10s / 10s）：
+     实测判死 9915ms、迁移段 0ms、端到端 9915ms，迁移时限达标；
+   * `--repro-profile fast`（2s×3=6s / 1s）：判死 5905ms、迁移段 0ms、
+     端到端 5905ms，便于快速回归。
 6. **媒体节点没有 HTTP 存活探针**（见 §2.1）。集群模式下容器内没有可探测的
    HTTP 端口，只有 `restart: unless-stopped`。如果需要容器级探针，
    建议后续给媒体端口加一个 TCP 探针（1.29.2 支持

@@ -76,9 +76,12 @@ node_role = "full"
 # 健康检查心跳间隔（秒）。
 heartbeat_secs = 5
 # 连续错过多少次心跳即判定节点故障。
-# 判死窗口 = heartbeat_secs × unhealthy_misses = 5 × 2 = 10s（验收标准 2）。
+# 判死窗口 = heartbeat_secs × unhealthy_misses = 5 × 2 = 10s（验收标准 2 的 SLO 起点）。
 unhealthy_misses = 2
-# 判定故障后，多久内必须完成会议迁移（秒）。
+# 判定故障后，多久内必须完成会议迁移（秒）。**起点是判死时刻，不是进程死亡时刻**：
+# 判死之前集群无法知道节点已经没了，那段属于判死窗口。默认配置下「进程死亡 →
+# 归属变更」= 判死窗口 10s + 迁移时限 10s = 最坏 20s，别把 10s 读成那个值。
+# 要收紧端到端时限就缩判死窗口（见 docs/CLUSTER_DESIGN.md §1.5 的配置纪律）。
 failover_target_secs = 10
 # 新节点上线后，多久内必须完成加入并开始承接新会议（秒）。
 join_target_secs = 30

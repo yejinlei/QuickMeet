@@ -21,7 +21,7 @@
 cargo build --release
 ./target/release/qm-demo
 
-# B. 完整回归测试（60 个测试，workspace 全部 crate）
+# B. 完整回归测试（209 个测试，workspace 全部 crate）
 cargo test --workspace
 
 # C. 起信令服务（长跑，Ctrl+C 退出；含 /healthz 探活）
