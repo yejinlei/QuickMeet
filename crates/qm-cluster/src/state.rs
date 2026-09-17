@@ -277,6 +277,15 @@ impl Node {
     pub fn is_schedulable(&self) -> bool {
         self.status == NodeStatus::Live && self.role == NodeRoleTag::Full
     }
+
+    /// 是否已经被判死（与 [`Self::is_schedulable`] 的镜像）。
+    ///
+    /// `status == Dead` 只说明本轮健康检查认为心跳过期，节点此时仍在视图里
+    /// （摘除要等宽限期，见 [`Registry::prune_dead`]）。复现工具与验收脚本用
+    /// 这个判断确定「判死时刻」—— 迁移的起点是判死而不是杀进程。
+    pub fn is_dead(&self) -> bool {
+        self.status == NodeStatus::Dead
+    }
 }
 
 /// 迁移请求载荷：故障节点 -> 候选目标节点。

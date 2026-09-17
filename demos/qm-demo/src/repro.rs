@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use qm_cluster::{bus, Cluster, NatsBus};
-use qm_common::{ClusterConfig, NodeRole};
+use qm_common::{Cidr, ClusterConfig, NodeRole};
 use serde::Serialize;
 
 /// 复现模式。
@@ -53,6 +53,72 @@ impl Mode {
     }
 }
 
+/// 复现用的窗口参数档位。
+///
+/// 为什么要有两档：`failover_target_secs` 约束的是「判死 → 归属变更」，而判死
+/// 之前集群无法知道节点已经没了。短档（默认）能把判死窗口压到 6s，让迁移与
+/// 僵尸摘除落在同一个短窗口内被观察到；`production` 档则与 `config/default.toml`
+/// 完全一致（10s 判死窗口 / 10s 迁移时限），用来回答「生产默认参数下这个数字
+/// 到底是多少」—— 而不是留一个只在调过参数的配置下才成立的指标。
+#[derive(Debug, Clone, Copy)]
+pub enum Profile {
+    /// 6s 判死窗口（2s × 3）/ 1s 迁移时限 / 7s 摘除宽限。
+    Fast,
+    /// 与 `config/default.toml` 一致：10s 判死窗口（5s × 2）/ 10s 迁移时限 / 20s 宽限。
+    Production,
+}
+
+impl Profile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Profile::Fast => "fast",
+            Profile::Production => "production(default.toml)",
+        }
+    }
+
+    fn heartbeat_secs(self) -> u64 {
+        match self {
+            Profile::Fast => 2,
+            Profile::Production => 5,
+        }
+    }
+
+    fn unhealthy_misses(self) -> u64 {
+        match self {
+            Profile::Fast => 3,
+            Profile::Production => 2,
+        }
+    }
+
+    fn failover_target_secs(self) -> u64 {
+        match self {
+            Profile::Fast => 1,
+            Profile::Production => 10,
+        }
+    }
+
+    /// 判死窗口（毫秒）。
+    fn window_ms(self) -> u64 {
+        self.heartbeat_secs()
+            .saturating_mul(self.unhealthy_misses().max(1))
+            .saturating_mul(1000)
+    }
+
+    /// 判死后必须完成的迁移时限（毫秒）。
+    fn deadline_ms(self) -> u64 {
+        self.failover_target_secs().saturating_mul(1000)
+    }
+
+    /// 故障阶段的总预算：判死窗口 + 迁移时限 + 一次轮次余量。
+    fn failover_budget(self) -> Duration {
+        Duration::from_millis(
+            self.window_ms()
+                .saturating_add(self.deadline_ms())
+                .saturating_add(5000),
+        )
+    }
+}
+
 /// 复现报告（`REPRO-RESULT:` 那行 JSON 的形状）。
 #[derive(Debug, Default, Serialize)]
 struct Report {
@@ -71,6 +137,20 @@ struct Report {
     legacy_discovery_ok: Option<bool>,
     /// legacy 模式的结论说明。
     legacy_verdict: String,
+    /// 窗口参数档位名（`fast` / `production(default.toml)`）。
+    profile_name: String,
+    /// 本次运行的窗口口径：`判死窗口 Ns / 宽限 Ms`。
+    profile: String,
+    /// 复现用的临时配置是否通过产品自己的启动期校验（B1 的防线）。
+    cfg_validation_passed: Option<bool>,
+    /// 该配置被 `validate()` 拒绝的原因；空数组表示通过。
+    cfg_validation_errors: Vec<String>,
+    /// 该配置能否经 `config/default.toml` + `QM_*` 环境变量到达（B1 的关键问题）。
+    config_reachable_via_defaults_and_env: Option<bool>,
+    /// 该配置能否经真实加载路径 `load_from`（含加载期校验）读出。
+    config_loadable: Option<bool>,
+    /// 反向对照的结论说明：旧配置必须被拒绝，否则防线是空转的。
+    config_validation_note: String,
     /// 成员发现：三个节点互相看见的节点数（验收标准 1 的前提）。
     discovered_nodes: usize,
     /// 各节点各自的成员视图（用来判断是「没发现」还是「视图不一致」）。
@@ -97,8 +177,23 @@ struct Report {
     view_reconverged: bool,
     /// 故障迁移是否成功（验收标准 3）。
     failover_ok: Option<bool>,
-    /// 从 kill 节点到房间归属变更的耗时（毫秒）。
+    /// 判死窗口（毫秒）= `heartbeat_secs × unhealthy_misses`。
+    failover_window_ms: u64,
+    /// 迁移时限（毫秒）= `failover_target_secs`，从**判死时刻**起算。
+    failover_deadline_ms: u64,
+    /// 从杀进程到判死（Dead 第一次出现在视图里）的耗时（毫秒）。
+    failover_detect_ms: u64,
+    /// **SLO 口径**：从判死时刻到房间归属变更的耗时（毫秒）。
+    /// `failover_target_secs` 约束的就是这个区间，而不是 `failover_ms_from_kill`。
     failover_ms: u64,
+    /// **端到端口径**：从杀进程到房间归属变更的耗时（毫秒），
+    /// 天然包含判死窗口本身。两个口径都报，避免「10s」被读成杀进程后 10s。
+    failover_ms_from_kill: u64,
+    /// SLO 是否达标（`failover_ms <= failover_deadline_ms`）。
+    failover_within_target: bool,
+    /// 本档配置的**端到端最坏值** = 判死窗口 + 迁移时限。
+    /// 「节点宕机 10s 内迁移」按生产默认参数就是这个 20s，不是判死后的 10s。
+    failover_end_to_end_worst_ms: u64,
     /// 迁移目标节点。
     failover_target: String,
     /// 故障节点摘除后集群视图的节点数（F7：节点数必须能回落）。
@@ -229,7 +324,16 @@ fn stage(msg: &str) {
 }
 
 /// 构造一个节点配置（同机 127.0.0.1 部署，node_id 各不相同）。
-pub fn node_cfg(i: usize, cluster_id: &str, port: u16, nats_port: u16) -> ClusterConfig {
+///
+/// 窗口参数由 [`Profile`] 决定；`request_timeout_secs` 恒为 1，
+/// 因为校验契约是**严格小于** `heartbeat_secs`。
+pub fn node_cfg(
+    i: usize,
+    cluster_id: &str,
+    port: u16,
+    nats_port: u16,
+    profile: Profile,
+) -> ClusterConfig {
     ClusterConfig {
         server: "127.0.0.1".to_string(),
         port: nats_port,
@@ -237,28 +341,147 @@ pub fn node_cfg(i: usize, cluster_id: &str, port: u16, nats_port: u16) -> Cluste
         node_id: format!("n{i}"),
         advertised_addr: format!("127.0.0.1:{port}"),
         node_role: NodeRole::Full,
-        heartbeat_secs: 1,
-        // 判死窗口 = 1s × 5 = 5s，而不是默认的 2s。
+        heartbeat_secs: profile.heartbeat_secs(),
+        // 判死窗口 = `heartbeat_secs × unhealthy_misses`。
         //
-        // 为什么必须放大：健康检查是**异步轮次**（每 `heartbeat_secs` 一次），而心跳
-        // 也是每 1s 一次。当两者周期接近时，一条刚发的心跳可能还没被接收端处理，
-        // 健康检查就先跑了 —— 于是「1s 前刚活着的节点」看起来像「1s 没心跳」。
-        // 窗口取 2s 时，这种竞态在真实运行里会周期性地把健康节点误判为 Dead
-        // （三次实测都出现了 `n0/n1/n2 同时 Dead、2s 后自己复活` 的抖动）。
-        // 窗口取 5s 之后心跳永远新鲜（误差 ≤1s），误判才会消失。
+        // 为什么必须明显大于一个心跳周期：健康检查是**异步轮次**（每 `heartbeat_secs`
+        // 一次），而心跳也是每 `heartbeat_secs` 一次。两者周期接近时，一条刚发的心跳
+        // 可能还没被接收端处理，健康检查就先跑了 —— 于是「刚发过心跳的节点」看起来
+        // 像「一次都没心跳」。窗口取 2s 配 1s 心跳时，这种竞态在真实运行里会周期性
+        // 地把健康节点误判为 Dead（三次实测都出现了 `n0/n1/n2 同时 Dead、2s 后自己
+        // 复活` 的抖动）。`Fast` 取 6s、`Production` 取 10s，心跳始终新鲜，误判消失。
         // 这同时说明：窗口必须明显大于「心跳周期 + 一次轮次延迟」，否则判死是竞态的。
-        unhealthy_misses: 5,
-        // 摘除宽限 = 窗口 + failover_target_secs = 6s。取 1s 让宽限 = 6s：
-        // 这样「10s 内完成迁移」与「僵尸节点被摘除」在同一个短窗口内都能观察到，
-        // 而不是让摘除阶段再等 10s。生产默认值仍是 `config/default.toml` 里的 10。
-        failover_target_secs: 1,
+        unhealthy_misses: profile.unhealthy_misses(),
+        // 摘除宽限 = 判死窗口 + failover_target_secs。`Fast` 取 1s 让宽限 = 7s，
+        // 迁移完成与僵尸摘除落在同一个短窗口内；`Production` 与 default.toml 一致。
+        failover_target_secs: profile.failover_target_secs(),
         join_target_secs: 30,
         request_timeout_secs: 1,
         max_rooms_per_node: 64,
         listener_capacity: 20_000,
         listener_fanout: 200,
-        health_port: 0,
+        // 探针端口不为 0：`AppConfig::validate` 明确拒绝 0（写 0 会让 docker
+        // healthcheck 没有端点可探）。复现不监听这个端口，但配置必须合法；
+        // 18100 + i 避开默认的 8080（媒体）/ 8081（信令）/ 8090（默认探针）。
+        health_port: 18_100 + i as u16,
     }
+}
+
+/// 临时配置目录：`load_from` 要读到的那份 `default.toml` 写在仓库根，
+/// 避免污染工作树（`repo_default_config_passes_cluster_validation` 读的就是它）。
+fn config_dir_for_repro() -> String {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .to_string_lossy()
+        .to_string();
+    std::path::Path::new(&repo_root)
+        .join("target")
+        .join("qm024-repro-config")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// 把一份节点配置渲染成合法的 `AppConfig`：补上校验层要看的其余段，
+/// 再把 `cluster` 段整体换成这份配置。
+fn app_cfg_for(cluster: &ClusterConfig) -> qm_common::AppConfig {
+    qm_common::AppConfig {
+        media: qm_common::config::MediaConfig::default(),
+        network: qm_common::config::NetworkConfig::default(),
+        logging: qm_common::config::LoggingConfig::default(),
+        storage: qm_common::config::StorageConfig::default(),
+        ai: qm_common::config::AiConfig::default(),
+        cluster: cluster.clone(),
+    }
+}
+
+/// 把一份 `AppConfig` 渲染成可直接被 `load_from` 读到的 `default.toml` 内容。
+/// 用于两条路径的对照：新配置应当读得出来，旧配置应当被拒。
+fn render_toml(app: &qm_common::AppConfig) -> String {
+    let c = &app.cluster;
+    format!(
+        "[media]\nport = {port}\nsignaling_port = {signal}\nmax_participants = {mp}\nidle_timeout_secs = {idle}\n\n\
+         [network]\ncidrs = {cidrs}\nbind_host = \"{bind}\"\n\n\
+         [logging]\nlevel = \"{lvl}\"\nfile_dir = \"\"\njson = {json}\n\n\
+         [storage]\ndata_dir = \"{dd}\"\nencrypted = {enc}\n\n\
+         [ai]\nenabled = {on}\nbase_url = \"{url}\"\ntimeout_ms = {tm}\n\n\
+         [cluster]\nserver = \"{srv}\"\nport = {nport}\ncluster_id = \"{cid}\"\nnode_id = \"{nid}\"\n\
+         advertised_addr = \"{adv}\"\nnode_role = \"{role}\"\nheartbeat_secs = {hb}\nunhealthy_misses = {um}\n\
+         failover_target_secs = {fo}\njoin_target_secs = {jt}\nrequest_timeout_secs = {rt}\n\
+         max_rooms_per_node = {mr}\nlistener_capacity = {lc}\nlistener_fanout = {lf}\nhealth_port = {hp}\n",
+        port = app.media.port,
+        signal = app.media.signaling_port,
+        mp = app.media.max_participants,
+        idle = app.media.idle_timeout_secs,
+        cidrs = serde_json::to_string(&app.network.cidrs).unwrap_or_else(|_| "[]".to_string()),
+        bind = app.network.bind_host,
+        lvl = app.logging.level,
+        json = app.logging.json,
+        dd = app.storage.data_dir,
+        enc = app.storage.encrypted,
+        on = app.ai.enabled,
+        url = app.ai.base_url,
+        tm = app.ai.timeout_ms,
+        srv = c.server,
+        nport = c.port,
+        cid = c.cluster_id,
+        nid = c.node_id,
+        adv = c.advertised_addr,
+        role = c.node_role.as_str(),
+        hb = c.heartbeat_secs,
+        um = c.unhealthy_misses,
+        fo = c.failover_target_secs,
+        jt = c.join_target_secs,
+        rt = c.request_timeout_secs,
+        mr = c.max_rooms_per_node,
+        lc = c.listener_capacity,
+        lf = c.listener_fanout,
+        hp = c.health_port,
+    )
+}
+
+/// 写一份 `default.toml` 并用**真实加载路径**读回（figment 解析 + 加载期校验）。
+fn load_rendered(toml: &str) -> Result<qm_common::AppConfig, String> {
+    let dir = config_dir_for_repro();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        std::path::Path::new(&dir).join("default.toml"),
+        toml.as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    qm_common::config::load_from(&dir).map(|(cfg, _)| cfg).map_err(|e| e.to_string())
+}
+
+/// B1 的防线：复现用的配置必须能通过产品**自己**的校验层，
+/// 并且必须能经 `default.toml` 这条真实加载路径到达。
+///
+/// 上一版把这份配置直接写成结构体字面量，绕过了整个校验层 —— 于是验收证据
+/// 是在一个「按产品自身规范非法、生产环境到不了」的配置下产生的。
+/// 这里同时做**反向对照**：旧配置必须被拒，否则这条防线是空转的。
+fn verify_config_reachability(cluster: &ClusterConfig) -> (Vec<String>, bool, bool, String) {
+    let app = app_cfg_for(cluster);
+    let mut errors = match app.validate() {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![e.to_string()],
+    };
+    let validate_ok = errors.is_empty();
+    let loaded = match load_rendered(&render_toml(&app)) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            errors.push(format!("load_from 拒绝：{e}"));
+            None
+        }
+    };
+    // 反证：同一份配置把 `request_timeout_secs` 抬到等于 `heartbeat_secs`、
+    // `health_port` 写 0，必须被拒。
+    let mut legacy = app.clone();
+    legacy.cluster.request_timeout_secs = legacy.cluster.heartbeat_secs;
+    legacy.cluster.health_port = 0;
+    let legacy_err = match load_rendered(&render_toml(&legacy)) {
+        Err(e) => e,
+        Ok(_) => "未被拒绝（防线失效）".to_string(),
+    };
+    (errors, validate_ok, loaded.is_some(), legacy_err)
 }
 
 /// 等端口可连（TCP 探测）。
@@ -441,9 +664,23 @@ async fn verify_failover(
         .env("QM_REPRO_NODE_ID", victim_id)
         .env("QM_REPRO_NATS_PORT", nats_port.to_string())
         .env("QM_REPRO_ROOM", &room_id)
-        .env("QM_REPRO_HEARTBEAT_SECS", "1")
-        .env("QM_REPRO_UNHEALTHY_MISSES", "5")
-        .env("QM_REPRO_FAILOVER_TARGET_SECS", "1")
+        // 与对端节点同一份窗口口径：受害者与存活节点必须同参数，
+        // 否则「多久判死」不是对端视图的口径，迁移数字就失去意义。
+        // 直接沿用对端节点已加载的配置值，不重复声明，避免两档漂移。
+        .env("QM_REPRO_HEARTBEAT_SECS", victim_cfg_snapshot.heartbeat_secs.to_string())
+        .env(
+            "QM_REPRO_UNHEALTHY_MISSES",
+            victim_cfg_snapshot.unhealthy_misses.to_string(),
+        )
+        .env(
+            "QM_REPRO_FAILOVER_TARGET_SECS",
+            victim_cfg_snapshot.failover_target_secs.to_string(),
+        )
+        .env(
+            "QM_REPRO_REQUEST_TIMEOUT_SECS",
+            victim_cfg_snapshot.request_timeout_secs.to_string(),
+        )
+        .env("QM_REPRO_HEALTH_PORT", "18100")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -498,13 +735,59 @@ async fn verify_failover(
     // 3) 真正杀掉故障节点：进程消失，心跳与所有请求都不会再回来。
     let kill_ms = unix_ms();
     child.kill().ok();
-    child.wait().ok();
-    stage("已杀掉故障节点子进程，等待 10s 故障迁移");
+    // 判死窗口（毫秒）：`heartbeat_secs × unhealthy_misses`，与对端节点同口径。
+    let window_ms = reporter
+        .cfg()
+        .heartbeat_secs
+        .saturating_mul(reporter.cfg().unhealthy_misses.max(1))
+        .saturating_mul(1000);
+    stage(&format!("已杀掉故障节点子进程（t0），判死窗口 {}ms", window_ms));
 
-    let deadline = Instant::now() + budget;
+    // 判死时刻（t_dead）：本节点视图里受害者第一次进入 `Dead`。
+    // 这是「迁移时限」的正确起点 —— 杀进程到判死之间还有整整一个判死窗口，
+    // 把那段算进 `failover_ms` 会把 SLO 起点说成杀进程，而不是判死。
+    let mut dead_ms: Option<u64> = None;
+    let detect_budget_ms = window_ms.saturating_mul(2).max(4000);
+    let detect_end = kill_ms.saturating_add(detect_budget_ms);
+    while unix_ms() <= detect_end {
+        for n in nodes {
+            let _ = n.health_check().await;
+        }
+        let dead = reporter
+            .nodes()
+            .iter()
+            .any(|n| n.node_id == victim_id && n.is_dead());
+        if dead {
+            dead_ms = Some(unix_ms());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if dead_ms.is_none() {
+        report.failover_ok = Some(false);
+        report.load_errors.push(format!(
+            "{}ms 内受害者未被判定为 Dead（判死窗口 {}ms）",
+            unix_ms().saturating_sub(kill_ms),
+            window_ms
+        ));
+    }
+
+    // 迁移时限：从**判死时刻**起算 `failover_target_secs`，而不是从杀进程起算。
+    let failover_ms = reporter
+        .cfg()
+        .failover_target_secs
+        .saturating_mul(1000)
+        .max(1);
+    let deadline_ms = dead_ms.unwrap_or(kill_ms).saturating_add(failover_ms);
+    stage(&format!(
+        "迁移 SLO：判死后 {}ms 内完成（判死发生在 t0+{}ms）",
+        failover_ms,
+        dead_ms.map(|d| d.saturating_sub(kill_ms)).unwrap_or(0)
+    ));
+
     let mut ok = false;
     let mut diag_at = Instant::now();
-    while Instant::now() < deadline {
+    while unix_ms() <= deadline_ms {
         // 显式驱动判死轮次：`health_loop` 也会跑，但这里保证计时从 kill 那一刻起算。
         for n in nodes {
             let _ = n.health_check().await;
@@ -547,8 +830,16 @@ async fn verify_failover(
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    let now_ms = unix_ms();
     report.failover_ok = Some(ok);
-    report.failover_ms = unix_ms().saturating_sub(kill_ms);
+    // 口径 A（**SLO 口径**）：从判死时刻起算。这才是 `failover_target_secs` 约束的区间。
+    report.failover_ms = now_ms.saturating_sub(dead_ms.unwrap_or(kill_ms));
+    // 口径 B（端到端口径）：从杀进程起算，包含判死窗口本身。
+    report.failover_ms_from_kill = now_ms.saturating_sub(kill_ms);
+    report.failover_detect_ms = dead_ms.map(|d| d.saturating_sub(kill_ms)).unwrap_or(0);
+    report.failover_window_ms = window_ms;
+    report.failover_deadline_ms = failover_ms;
+    report.failover_within_target = ok && report.failover_ms <= failover_ms;
     report.failover_target = reporter.room_owner(&room_id).flatten().unwrap_or_default();
 
     // 跨节点一致性：三个节点的视图都必须收敛到「不再是受害者归属」。
@@ -565,10 +856,14 @@ async fn verify_failover(
         }
     }
 
-    // 4) F7 摘除阶段：判死后节点进入 Dead，grace（窗口 + failover_target_secs）
+    // 4) F7 摘除阶段：判死后节点进入 Dead，grace（判死窗口 + failover_target_secs）
     //    到期后 `prune_dead` 才把它从视图里拿掉。这一步是独立的结果，
     //    单独计时，避免把「迁移成功」误读成「僵尸节点已摘除」。
-    let prune_deadline = Instant::now() + Duration::from_secs(25);
+    //
+    // 时限取 `grace + 判死窗口` 的 2 倍余量：摘除起点是判死时刻（`dead_since_ms`），
+    // 但 `prune_dead` 只在本轮 `health_check` 里跑，最长还要等一个轮次。
+    let grace_ms = window_ms.saturating_add(failover_ms);
+    let prune_deadline = Instant::now() + Duration::from_millis(grace_ms.saturating_mul(2).max(10_000));
     let mut reaped = false;
     while Instant::now() < prune_deadline {
         for n in nodes {
@@ -577,7 +872,7 @@ async fn verify_failover(
         let dead = reporter
             .nodes()
             .iter()
-            .filter(|n| n.node_id == victim_id && n.status == qm_cluster::NodeStatus::Dead)
+            .filter(|n| n.node_id == victim_id && n.is_dead())
             .count();
         let gone = reporter.nodes().iter().all(|n| n.node_id != victim_id);
         if dead > 0 {
@@ -592,7 +887,7 @@ async fn verify_failover(
     report.dead_nodes_detected = reporter
         .nodes()
         .iter()
-        .filter(|n| n.status == qm_cluster::NodeStatus::Dead)
+        .filter(|n| n.is_dead())
         .count();
     report.has_dead_since_ms = reporter
         .nodes()
@@ -607,12 +902,29 @@ async fn verify_failover(
     report.migrations_attempted = st.migrations_attempted;
     report.migrations_completed = st.migrations_completed;
     report.load_notes.push(format!(
-        "迁移前归属={victim_id}，迁移后归属={}，耗时 {}ms，10s 预算内完成={ok}",
-        report.failover_target, report.failover_ms
+        "迁移 SLO（判死→归属变更）={}ms / 时限 {}ms，达标={}",
+        report.failover_ms,
+        report.failover_deadline_ms,
+        report.failover_within_target
     ));
     report.load_notes.push(format!(
-        "受害者判死={reaped}，已从集群视图摘除={}（剩余 {} 节点）",
-        report.victim_pruned, report.nodes_after_prune
+        "端到端（杀进程→归属变更）={}ms，其中判死 {}ms + 迁移 {}ms",
+        report.failover_ms_from_kill,
+        report.failover_detect_ms,
+        report.failover_ms
+    ));
+    report.load_notes.push(format!(
+        "迁移前归属={victim_id}，迁移后归属={}，端到端 {}ms（{}ms 预算内={}）",
+        report.failover_target,
+        report.failover_ms_from_kill,
+        budget.as_millis() as u64,
+        report.failover_ms_from_kill <= (budget.as_millis() as u64)
+    ));
+    report.load_notes.push(format!(
+        "受害者判死={reaped}，已从集群视图摘除={}（剩余 {} 节点，宽限 {}ms）",
+        report.victim_pruned,
+        report.nodes_after_prune,
+        grace_ms
     ));
 }
 
@@ -656,16 +968,24 @@ pub async fn run_victim() -> Result<(), String> {
         node_id,
         advertised_addr: "127.0.0.1:8199".to_string(),
         node_role: NodeRole::Full,
-        heartbeat_secs: env_u64("QM_REPRO_HEARTBEAT_SECS", 1).max(1),
-        unhealthy_misses: env_u64("QM_REPRO_UNHEALTHY_MISSES", 2).max(1),
+        // 与对端节点同窗口：受害者必须用同样的判死参数，否则「多久判死」
+        // 不是对端节点的视图口径，验收数字就失去意义。
+        heartbeat_secs: env_u64("QM_REPRO_HEARTBEAT_SECS", 2).max(1),
+        unhealthy_misses: env_u64("QM_REPRO_UNHEALTHY_MISSES", 3).max(1),
         failover_target_secs: env_u64("QM_REPRO_FAILOVER_TARGET_SECS", 10),
         join_target_secs: 30,
-        request_timeout_secs: 1,
+        request_timeout_secs: env_u64("QM_REPRO_REQUEST_TIMEOUT_SECS", 1).max(1),
         max_rooms_per_node: 64,
         listener_capacity: 20_000,
         listener_fanout: 200,
-        health_port: 0,
+        // 探针端口不为 0（`AppConfig::validate` 明确拒绝 0）。受害者不监听它，
+        // 但配置必须与对端一样合法，不能靠绕过校验层来跑。
+        health_port: env_u64("QM_REPRO_HEALTH_PORT", 18_100).clamp(1, 65535) as u16,
     };
+    // 显式走产品自己的校验：受害者如果对端节点用不了这份配置，就不该被用来
+    // 当「真实故障节点」。`127.0.0.0/8` 是本机回环组网的允许段。
+    cfg.validate(&[Cidr::parse("127.0.0.0/8").expect("127.0.0.0/8 是合法 CIDR")])
+        .map_err(|e| format!("受害者配置未通过 validate()：{e}"))?;
 
     let victim = Arc::new(Cluster::new(cfg));
     victim.clone().initialize().await;
@@ -690,7 +1010,7 @@ pub async fn run_victim() -> Result<(), String> {
 }
 
 /// 入口：跑完整套复现并打印 `REPRO-RESULT:` JSON。
-pub async fn run(_config_dir: &str, nats_binary: &str, mode: Mode) -> Result<(), String> {
+pub async fn run(_config_dir: &str, nats_binary: &str, mode: Mode, profile: Profile) -> Result<(), String> {
     let cluster_id = format!("qm024-{}", std::process::id());
     let prefix = bus::subject_prefix(&cluster_id);
 
@@ -715,15 +1035,67 @@ pub async fn run(_config_dir: &str, nats_binary: &str, mode: Mode) -> Result<(),
 
     // 先建三个节点但**还没** initialize —— 让 connect_loop 有机会在 NATS 未就绪时重试。
     let nodes: Vec<Arc<Cluster>> = (0..3u16)
-        .map(|i| Arc::new(Cluster::new(node_cfg(i as usize, &cluster_id, 8100 + i, nats_port))))
+        .map(|i| Arc::new(Cluster::new(node_cfg(i as usize, &cluster_id, 8100 + i, nats_port, profile))))
         .collect();
     let reporter = nodes[0].clone();
+
+    // ── 前置断言 0：配置可达性（B1）──
+    //
+    // `Cluster::new` 不跑校验层，所以这里必须显式跑一次：复现用的配置若被
+    // `AppConfig::validate` 拒绝，它就不是生产能到达的配置，验收数据也就失去
+    // 意义。同时做一次反向对照，证明这条防线不是空转的。
+    let profile_name = profile.as_str().to_string();
+    let profile_deadline_ms = profile.deadline_ms();
+
+    stage(&format!(
+        "前置断言 0：复现配置必须通过产品自己的 validate() 且能被真实加载（档位 {profile_name}）"
+    ));
+    let base_cfg = nodes[0].cfg().clone();
+    let window_ms = base_cfg
+        .heartbeat_secs
+        .saturating_mul(base_cfg.unhealthy_misses.max(1))
+        .saturating_mul(1000);
+    let grace_ms = window_ms.saturating_add(base_cfg.failover_target_secs.saturating_mul(1000));
+    report.failover_window_ms = window_ms;
+    report.failover_deadline_ms = base_cfg.failover_target_secs.saturating_mul(1000);
+    report.profile_name = profile_name.clone();
+    // 本档配置的**端到端最坏值**（判死窗口 + 迁移时限）：验收表里「10s」
+    // 必须按这个口径解释，而不是按判死之后的 10s。
+    report.failover_end_to_end_worst_ms = window_ms.saturating_add(report.failover_deadline_ms);
+    report.profile = format!(
+        "判死窗口 {}ms（{}s×{}）/ 迁移时限 {}ms / 摘除宽限 {}ms",
+        window_ms,
+        base_cfg.heartbeat_secs,
+        base_cfg.unhealthy_misses,
+        report.failover_deadline_ms,
+        grace_ms
+    );
+    let (cfg_errors, cfg_ok, cfg_loaded, cfg_legacy_rejected) =
+        verify_config_reachability(&base_cfg);
+    report.cfg_validation_passed = Some(cfg_ok);
+    report.cfg_validation_errors = cfg_errors.clone();
+    report.config_reachable_via_defaults_and_env = Some(cfg_ok && cfg_loaded);
+    report.config_loadable = Some(cfg_loaded);
+    report.config_validation_note = format!(
+        "旧配置（request_timeout_secs == heartbeat_secs, health_port = 0）经 load_from 被拒：{cfg_legacy_rejected}"
+    );
+    if !cfg_ok || !cfg_loaded {
+        nats.kill().ok();
+        nats.wait().ok();
+        println!(
+            "REPRO-FAIL:{}",
+            serde_json::to_string(&report).unwrap()
+        );
+        let _ = std::io::stdout().flush();
+        return Err(format!("复现配置未通过校验：{:?}", cfg_errors));
+    }
+    stage(&format!("配置校验通过：{}", report.profile));
 
     // F1 裁决：legacy 模式下实测心跳订阅能不能收到心跳。
     if mode == Mode::Legacy {
         stage("legacy 模式：起探针节点，实测 `hb.*` 的投递");
         // 起一个探针节点，让 subject 规划生效，然后测 `hb.*` 的投递行为。
-        let probe_node = Arc::new(Cluster::new(node_cfg(7, &cluster_id, 8170, nats_port)));
+        let probe_node = Arc::new(Cluster::new(node_cfg(7, &cluster_id, 8170, nats_port, profile)));
         probe_node.clone().initialize().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         if let Some(ok) = probe_subscription(&prefix, &probe_node, &mode.heartbeat_all(&prefix))
@@ -845,7 +1217,10 @@ pub async fn run(_config_dir: &str, nats_binary: &str, mode: Mode) -> Result<(),
     stage(&format!("压测：{}/{} 成功，总耗时 {}ms", report.load_ok, report.load_total, report.load_ms));
 
     // ── 断言 5：10s 故障迁移（验收标准 3）──
-    stage("断言 5：10s 故障迁移");
+    stage(&format!(
+        "断言 5：故障迁移（档位 {}，SLO = 判死后 {}ms）",
+        profile_name, profile_deadline_ms
+    ));
     // 受害者就是**本程序自己**的子进程（`--repro-victim`）：受害者必须能真正被
     // 杀掉，所以不能是 NATS 二进制，也不能是同一进程里的另一个连接。
     let victim_exe = std::env::current_exe()
@@ -855,7 +1230,7 @@ pub async fn run(_config_dir: &str, nats_binary: &str, mode: Mode) -> Result<(),
         &nodes,
         reporter,
         &mut report,
-        Duration::from_secs(10),
+        profile.failover_budget(),
         &victim_exe,
         nats_port,
     )

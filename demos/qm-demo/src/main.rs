@@ -66,6 +66,13 @@ struct Args {
     #[arg(long, default_value = "post")]
     repro_mode: String,
 
+    /// 复现用的窗口参数档位：
+    /// `fast`（默认，判死窗口 6s / 迁移时限 1s）或
+    /// `production`（与 `config/default.toml` 一致：判死窗口 10s / 迁移时限 10s）。
+    /// 「10s 宕机迁移」按生产默认参数下的实际数字报，不只在调过参数的配置下成立。
+    #[arg(long, default_value = "fast")]
+    repro_profile: String,
+
     /// 受害者子进程模式（QM-024 复现工具的故障节点，由 `--repro` 用子进程方式拉起）。
     /// 只读环境变量 `QM_REPRO_*`，不接受其它参数。
     #[arg(long)]
@@ -122,10 +129,17 @@ fn run() -> anyhow::Result<()> {
                 "post" => repro::Mode::Post,
                 other => anyhow::bail!("--repro-mode 取值非法：{other}（合法值：post / legacy）"),
             };
+            let profile = match args.repro_profile.as_str() {
+                "fast" => repro::Profile::Fast,
+                "production" => repro::Profile::Production,
+                other => anyhow::bail!(
+                    "--repro-profile 取值非法：{other}（合法值：fast / production）"
+                ),
+            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(repro::run(&args.config, &nats_bin, mode))
+            runtime.block_on(repro::run(&args.config, &nats_bin, mode, profile))
                 .map_err(anyhow::Error::msg)?;
             return Ok(());
         }
