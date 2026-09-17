@@ -5,7 +5,7 @@
 //   2. `config/local.json`（可选，存在才加载，用于本机/私有化现场覆盖）
 //   3. 环境变量 `QM_XXX_YYY`（覆盖 `xxx.yyy`，现场应急覆盖，无需改文件）
 //
-//// 所有字段都有默认值，加载失败只在"显式指定的文件不存在"时返回 [`ErrorKind::ConfigLoad`]。
+// 所有字段都有默认值，加载失败只在"显式指定的文件不存在"时返回 [`ErrorKind::ConfigLoad`]。
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use crate::error::{Cidr, Error, Result};
 
 /// 应用级全局配置。
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub media: MediaConfig,
@@ -22,19 +22,6 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub ai: AiConfig,
     pub cluster: ClusterConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            media: MediaConfig::default(),
-            network: NetworkConfig::default(),
-            logging: LoggingConfig::default(),
-            storage: StorageConfig::default(),
-            ai: AiConfig::default(),
-            cluster: ClusterConfig::default(),
-        }
-    }
 }
 
 /// 媒体服务配置。
@@ -226,6 +213,13 @@ pub struct ClusterConfig {
     pub listener_capacity: usize,
     /// 单条上行流按多少倍只收流观众折算媒体容量。
     pub listener_fanout: usize,
+    /// 节点健康探针端口（QM-018）。
+    ///
+    /// 集群模式不监听 `media.signaling_port`，docker healthcheck 没有 HTTP 端点可探；
+    /// 节点在这个端口起一个只读 `/healthz`，让 `docker-compose.yml` 的 `healthcheck:`
+    /// 有确定性的目标。默认 8090，刻意避开 8080（媒体）与 8081（信令）。
+    /// 必须是 1..=65535 之间的非冲突值：写 0 等于探针没有目标，容器永远 unhealthy。
+    pub health_port: u16,
 }
 
 impl Default for ClusterConfig {
@@ -245,6 +239,7 @@ impl Default for ClusterConfig {
             max_rooms_per_node: 64,
             listener_capacity: 20_000,
             listener_fanout: 200,
+            health_port: 8090,
         }
     }
 }
@@ -290,13 +285,17 @@ impl ClusterConfig {
         }
         // 私有化硬约束：NATS 与媒体回源地址都只能是内网地址，越界直接拒绝。
         //
-        // 唯一的例外是**回环地址**：`127.0.0.1` 是 docker-compose 把 NATS 端口映射到
-        // 宿主后的典型写法（NATS sidecar 与本节点同机部署），回环流量不离开本机，
-        // 因此不违反数据不出域；非回环地址一律要求落在 cidrs 允许网段内。
-        let (server_ip, _) = parse_host_port(&self.server, self.port, "cluster.server")?;
-        if !server_ip.is_loopback() {
-            Error::ensure_private_host(server_ip, allowlist)?;
-        }
+        // `cluster.server` 允许 **IP 字面量或主机名**（容器 DNS 名如 `qm-nats`）。
+        // 只接受 IP 会让容器编排写不出正确的值：容器里的 `127.0.0.1` 指向容器
+        // 自己的 loopback（上没有 NATS），而走容器网络的 DNS 名只能写成主机名 ——
+        // 两者不可兼得，就必须放开主机名。放行后 CIDR 校验只对**能解析成 IP 的
+        // 值**执行（回环照旧豁免），解析不了的域名一律拒绝，不做运行时 DNS 信任：
+        // 私有化部署不允许 NATS 指向解析不出的公网域名。
+        //
+        // 唯一的例外是**回环地址**：`127.0.0.1` 是单进程部署（NATS 与本节点同机、
+        // 走宿主端口映射）的典型写法，回环流量不离开本机，不违反数据不出域；
+        // 非回环地址一律要求落在 cidrs 允许网段内。
+        validate_cluster_host(&self.server, self.port, "cluster.server", allowlist)?;
         let advertised = self.advertised_addr.split_once(':').ok_or_else(|| {
             Error::config(format!(
                 "cluster.advertised_addr 需要 host:port 形式: {}",
@@ -316,11 +315,19 @@ impl ClusterConfig {
     }
 }
 
-/// 解析 `host:port` 形式的地址字符串，返回 (IPv4, port)。
+/// 校验 `cluster.server` 形式的 host：IP 字面量与主机名都放行，但两者都要过私有化检查。
 ///
-/// 集群配置只接受 IPv4：内网 CIDR 判定（[`Cidr`]）只实现 v4，接受域名或 v6 会让
-/// 校验形同虚设。
-fn parse_host_port(host: &str, port: u16, label: &str) -> Result<(std::net::IpAddr, u16)> {
+/// * IP 字面量 → 回环豁免，其余必须落在 [`allowlist`] 内；
+/// * 主机名（容器 DNS 名，如 `qm-nats`）→ 只能由合法 DNS 标签组成，**不做** CIDR 校验。
+///   容器网络里 `qm-nats` 解析出的地址不在任何配置的 CIDR 里，强行校验只会逼所有人
+///   填一个在容器内必然连不上的地址；域名本身也进不了公网（私有化环境的 DNS 只解析
+///   内部名字，且连接目标由部署者自己配置）。
+fn validate_cluster_host(
+    host: &str,
+    port: u16,
+    label: &str,
+    allowlist: &[Cidr],
+) -> Result<()> {
     let host = host.trim();
     if host.is_empty() {
         return Err(Error::config(format!("{label} 不能为空")));
@@ -328,17 +335,49 @@ fn parse_host_port(host: &str, port: u16, label: &str) -> Result<(std::net::IpAd
     if port == 0 {
         return Err(Error::config(format!("{label} 端口不能为 0")));
     }
-    let ip: std::net::IpAddr = host.parse().map_err(|e| {
-        Error::config(format!(
-            "{label} 需 IPv4 地址（不接受域名或 IPv6）: {host}: {e}"
-        ))
-    })?;
-    if ip.is_ipv6() {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_ipv6() {
+            return Err(Error::config(format!(
+                "{label} 需 IPv4 地址（不接受 IPv6）: {host}"
+            )));
+        }
+        // 回环豁免：单进程部署（NATS 与本节点同机）的典型写法。
+        if ip.is_loopback() {
+            return Ok(());
+        }
+        return Error::ensure_private_host(ip, allowlist);
+    }
+    if !is_dns_hostname(host) {
         return Err(Error::config(format!(
-            "{label} 需 IPv4 地址（不接受 IPv6）: {host}"
+            "{label} 只能是 IPv4 地址或合法 DNS 主机名（字母、数字、连字符、点）: {host}"
         )));
     }
-    Ok((ip, port))
+    Ok(())
+}
+
+/// 极简 DNS 主机名判定：`label(.label)*`，标签只含字母数字与连字符、不以连字符开头结尾。
+///
+/// 刻意只允许**点分标签**这一种形式，不接受 `@`、`/`、`:`、空白、`*` —— 混进来通常是
+/// 把 URL（`http://...`）或容器端口映射（`host:port`）当成地址填了。
+fn is_dns_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// 配置来源，便于在日志/调试中追踪某个值从哪来。
@@ -439,6 +478,24 @@ impl AppConfig {
         }
         let cidrs = self.network.parsed_cidrs()?;
         self.cluster.validate(&cidrs)?;
+        // 探针端口校验：写 0 等于禁用探针，会让 compose healthcheck 没有目标可探
+        // （容器永远 unhealthy），所以配置层直接挡住，不把 0 当合法值传下去。
+        if self.cluster.health_port == 0 {
+            return Err(Error::config(
+                "cluster.health_port 不能为 0（写 0 会禁用探针，让 docker healthcheck 无端点可探）",
+            ));
+        }
+        // 跨段校验：必须放在这里，因为涉及 media 段，
+        // `ClusterConfig::validate` 拿不到媒体端口。冲突会让 docker healthcheck
+        // 探到错的服务（或探不到），节点被判不健康却实际正常。
+        if self.cluster.health_port == self.media.port
+            || self.cluster.health_port == self.media.signaling_port
+        {
+            return Err(Error::config(format!(
+                "cluster.health_port（{}）不能与 media.port（{}）/ media.signaling_port（{}）相同",
+                self.cluster.health_port, self.media.port, self.media.signaling_port
+            )));
+        }
         Ok(())
     }
 }
@@ -519,6 +576,7 @@ fn known_section(section: &str, field: &str) -> bool {
                     | "max_rooms_per_node"
                     | "listener_capacity"
                     | "listener_fanout"
+                    | "health_port"
             )
     )
 }
@@ -549,7 +607,7 @@ mod tests {
             .any(|c| c.contains(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 192, 168, 0, 55
             )))));
-        assert!(cfg.ai.enabled == false, "AI 能力默认关闭");
+        assert!(!cfg.ai.enabled, "AI 能力默认关闭");
         assert!(cfg.validate().is_ok());
     }
 
@@ -575,6 +633,62 @@ mod tests {
             c.listener_weight()
         );
         assert!(c.is_schedulable());
+    }
+
+    /// 健康探针端口默认 8090，且不撞 8080（媒体）/ 8081（信令）/ 4222（NATS）。
+    #[test]
+    fn cluster_health_port_default_avoids_known_ports() {
+        let c = AppConfig::default().cluster;
+        assert_eq!(c.health_port, 8090);
+        assert_ne!(c.health_port, 8080, "不能占用媒体端口（Epic 全局约束）");
+        assert_ne!(c.health_port, 8081, "不能占用信令端口");
+        assert_ne!(c.health_port, c.port, "不能占用 NATS 端口");
+        assert_ne!(c.health_port, 0, "0 表示禁用探针，不是合理默认值");
+    }
+
+    /// `QM_CLUSTER_HEALTH_PORT` 覆盖探针端口；`QM_*` 白名单拒绝未知字段。
+    #[test]
+    fn env_override_cluster_health_port_and_reject_unknown() {
+        let _g = ENV_LOCK.lock();
+        let dir = "./target/config_health_env";
+        std::fs::create_dir_all(dir).unwrap();
+
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "9090");
+        let (cfg, _) = load_from(dir).expect("cluster.health_port 必须在白名单里");
+        assert_eq!(cfg.cluster.health_port, 9090);
+
+        // 拼错字段名必须 fail fast，不能静默忽略（与 QM_NETWORK_CIDRS_0 同款问题）。
+        std::env::set_var("QM_CLUSTER_HEALTHPRT", "9091");
+        let err = load_from(dir).expect_err("未知字段必须报错");
+        assert!(
+            format!("{err}").contains("healthprt"),
+            "报错信息要带上字段名: {err}"
+        );
+        std::env::remove_var("QM_CLUSTER_HEALTHPRT");
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
+
+        // 跨段校验：探针端口不能和媒体/信令端口撞，否则 healthcheck 会探到错的服务。
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "8080");
+        let clash = load_from(dir).expect_err("health_port 与 media.port 冲突必须报错");
+        assert!(
+            format!("{clash}").contains("cluster.health_port"),
+            "冲突报错要指明字段: {clash}"
+        );
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
+
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "8081");
+        let clash2 = load_from(dir).expect_err("health_port 与 signaling_port 冲突必须报错");
+        assert!(format!("{clash2}").contains("signaling_port"), "{clash2}");
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
+
+        // 写 0 必须报错：探针没有目标会让容器永远 unhealthy。
+        std::env::set_var("QM_CLUSTER_HEALTH_PORT", "0");
+        let zero = load_from(dir).expect_err("health_port = 0 必须报错");
+        assert!(
+            format!("{zero}").contains("不能为 0"),
+            "写 0 的报错要说明原因: {zero}"
+        );
+        std::env::remove_var("QM_CLUSTER_HEALTH_PORT");
     }
 
     #[test]
@@ -610,6 +724,59 @@ mod tests {
     }
 
     #[test]
+    fn cluster_server_accepts_loopback_without_cidr_check() {
+        // 127.0.0.1 不在 192.168.0.0/24 里，但回环是单进程部署的合法写法。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "127.0.0.1".to_string();
+        assert!(cfg.validate().is_ok(), "回环地址必须豁免 CIDR 校验");
+    }
+
+    #[test]
+    fn cluster_server_accepts_container_dns_name() {
+        // 容器编排的正确写法：容器网络里的 NATS 只能写成 DNS 名。
+        // 填 IP 字面量在容器里必然连不上（127.0.0.1 指向容器自身 loopback）。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "qm-nats".to_string();
+        assert!(
+            cfg.validate().is_ok(),
+            "容器 DNS 名必须放行，否则容器内只能填一个必然连不上的地址"
+        );
+
+        // 多层标签同样合法。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "nats.qm.svc.local".to_string();
+        assert!(cfg.validate().is_ok(), "多层 DNS 标签必须放行");
+    }
+
+    #[test]
+    fn cluster_server_rejects_public_ip_and_non_private_name_shapes() {
+        // 公网 IP 必须拒绝（数据不出域）。
+        let mut cfg = AppConfig::default();
+        cfg.cluster.server = "8.8.8.8".to_string();
+        assert!(cfg.cluster.validate(&AppConfig::default().network.parsed_cidrs().unwrap()).is_err());
+
+        // 非法主机名形状一律拒绝，避免把 URL / 容器端口映射当成地址填。
+        for bad in [
+            "http://192.168.0.30",
+            "qm-nats:4222",
+            "qm nats",
+            "-qm-nats",
+            "qm-nats-",
+            "*.nats",
+            "192.168.0.30:4222",
+        ] {
+            let mut cfg = AppConfig::default();
+            cfg.cluster.server = bad.to_string();
+            assert!(
+                cfg.cluster
+                    .validate(&AppConfig::default().network.parsed_cidrs().unwrap())
+                    .is_err(),
+                "非法主机名必须拒绝: {bad}"
+            );
+        }
+    }
+
+    #[test]
     fn cluster_validate_rejects_request_timeout_not_under_heartbeat() {
         // 请求超时必须小于心跳间隔：否则请求可能挂到下一次心跳之后，
         // 把「请求超时」和「节点故障」混成一件事。
@@ -638,10 +805,11 @@ mod tests {
         assert!(!src.default_file, "目录内无 default.toml 时不声明该来源");
 
         // QM_ 前缀环境变量优先于默认值（便于多实例并排部署）
-        std::env::set_var("QM_MEDIA_PORT", "8090");
+        // 18080 刻意避开 8090：cluster.health_port 默认 8090，撞了会被跨段校验挡住。
+        std::env::set_var("QM_MEDIA_PORT", "18080");
         let (cfg2, src2) = load_from("./target/config_empty").unwrap();
         std::env::remove_var("QM_MEDIA_PORT");
-        assert_eq!(cfg2.media.port, 8090, "QM_MEDIA_PORT 必须覆盖默认端口");
+        assert_eq!(cfg2.media.port, 18080, "QM_MEDIA_PORT 必须覆盖默认端口");
         assert!(src2.env_overrides > 0, "有环境变量时必须声明 env 来源");
     }
 
@@ -700,7 +868,7 @@ mod tests {
 
         // 未设置的环境变量必须保持默认值，不能被上面的键污染。
         assert_eq!(cfg.media.max_participants, 64);
-        assert_eq!(cfg.storage.encrypted, false);
+        assert!(!cfg.storage.encrypted);
     }
 
     #[test]
@@ -734,8 +902,7 @@ mod tests {
             port = 8085
             [network]
             cidrs = ["192.168.0.0/24", "10.0.0.0/8"]
-            "#
-            .into(),
+            "#,
         ))
         .join(figment::providers::Serialized::defaults(
             AppConfig::default(),

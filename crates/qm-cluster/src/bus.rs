@@ -2,7 +2,7 @@
 //!
 //! 设计取舍：
 //! * 只用 **core NATS**（不引入 JetStream / KV）：房间状态是短生命周期的实时数据，
-//!   掉线靠节点重启后重新订阅 + 一次全量快照恢复，不需要持久化队列。
+//!   掉线靠节点重启后重新订阅 + 周期广播的房间快照恢复，不需要持久化队列。
 //! * 每个 subject 只承载一种消息类型，业务层不做类型分派。
 //! * 所有 subject 都带 `cluster_id` 前缀，多集群（测试 / 生产）共用一个 NATS server
 //!   时也不会串。
@@ -44,7 +44,8 @@ pub fn subject_room(prefix: &str, room_id: &str) -> String {
     format!("{prefix}.room.{}", room_id)
 }
 
-/// 房间全量快照 subject：新节点上线时一次追上，避免靠订阅顺序拼状态。
+/// 房间全量快照 subject：各节点每 `heartbeat_secs` 广播一次自己归属的房间，
+/// 晚到的节点靠它追上全量状态，避免靠订阅顺序拼状态。
 pub fn subject_room_snapshot(prefix: &str) -> String {
     format!("{prefix}.room.snapshot")
 }
@@ -96,7 +97,7 @@ pub struct Subjects {
     pub heartbeat_all: String,
     pub room_snapshot: String,
     pub route_new: String,
-    /// 本节点自己的迁移请求 subject（队列消费用）。
+    /// 投给本节点的迁移请求 subject（每个目标节点各自订阅，不做队列分摊）。
     pub migrate_for_self: String,
     pub migrate_done: String,
 }
@@ -124,6 +125,17 @@ impl Subjects {
     pub fn migrate_for(&self, target_node: &str) -> String {
         subject_migrate_for(&self.prefix, target_node)
     }
+}
+
+/// 房间全量快照载荷。
+///
+/// `total` 是**发送方看到的全集群房间数**，不是 `rooms.len()`：
+/// `rooms` 只含发送方自己归属的房间（跨节点发快照时用），
+/// 所以必须单独携带 total，接收方才判断得出一份快照是否覆盖了整个集群。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotPayload {
+    pub total: usize,
+    pub rooms: Vec<RoomState>,
 }
 
 /// NATS 客户端封装：把 `async_nats::Client` 收在这一层，业务层只面对本类型。
@@ -192,9 +204,21 @@ impl NatsBus {
         self.publish_json(&self.subjects.room(&room.id), room).await
     }
 
-    /// 广播房间全量快照（供新节点上线时一次追上）。
-    pub async fn publish_snapshot(&self, rooms: &[RoomState]) -> QmResult<()> {
-        self.publish_json(&self.subjects.room_snapshot, rooms).await
+    /// 广播房间全量快照（`snapshot_publish_loop` 每 `heartbeat_secs` 发一次）。
+    ///
+    /// 带一个 `total` 字段：**发送方**自己的房间视图总数，不是 `rooms` 的长度。
+    /// `rooms` 只包含本节点归属的房间，但 total 是发送方看到的全集群房间数 ——
+    /// 两者必须分开，否则无法判断「这份快照有没有覆盖全集群」（见
+    /// [`Cluster::apply_remote_snapshot`](crate::Cluster::apply_remote_snapshot)）。
+    pub async fn publish_snapshot(&self, rooms: &[RoomState], total: usize) -> QmResult<()> {
+        self.publish_json(
+            &self.subjects.room_snapshot,
+            &SnapshotPayload {
+                total,
+                rooms: rooms.to_vec(),
+            },
+        )
+        .await
     }
 
     /// 订阅一个 subject，返回不断 yield `async_nats::Message` 的流。
@@ -210,8 +234,9 @@ impl NatsBus {
 
     /// 队列订阅：同一 subject 下同一队列名的消费者共享消息（负载分摊）。
     ///
-    /// 调度请求与迁移请求都走队列订阅 —— 三个节点同时收同一个请求时，
-    /// 只有队列里的一个会处理，其余节点直接不收到。
+    /// 只给**房间调度请求**用 —— 三个节点同时收同一个请求时，只有队列里的
+    /// 一个会处理。迁移请求**不能**用队列：目标在发起方已经选定，队列会让
+    /// 别的节点抢走这条消息后直接丢弃。
     pub async fn queue_subscribe(
         &self,
         subject: &str,

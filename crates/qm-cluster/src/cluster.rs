@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use qm_common::{ClusterConfig, NodeRole, Result as QmResult};
 
-use crate::bus::{MigrationResult, NatsBus, RoomRouteRequest};
+use crate::bus::{MigrationResult, NatsBus, RoomRouteRequest, SnapshotPayload};
 use crate::state::{
     unix_ms, HeartbeatMsg, MigrationRequest, Node, NodeRoleTag, NodeStatus, Registry, RoomState,
     Router, DEFAULT_NEW_ROOM_STREAMS,
@@ -31,6 +31,14 @@ use crate::state::{
 
 /// 单节点上同时持有的 NATS 发送端数量上限（心跳 + 4 个订阅 + 若干请求）。
 const DEFAULT_PUBLISHER_CAPACITY: usize = 64;
+
+/// NATS 重连最小重试间隔（秒）。
+const NATS_RECONNECT_MIN_SECS: u64 = 2;
+/// NATS 重连最大重试间隔（秒）：指数退避的封顶。
+///
+/// 与集群判死窗口（`heartbeat_secs × unhealthy_misses` 默认 10s）放在同一个
+/// 量级：重试节奏比判死窗口拖得太窄会反而拉长故障恢复时间。
+const NATS_RECONNECT_MAX_SECS: u64 = 30;
 
 /// 集群门面。
 pub struct Cluster {
@@ -129,41 +137,130 @@ impl Cluster {
     /// 初始化：连接 NATS，注册自身，启动全部后台任务。
     ///
     /// 连接失败**不让进程退出** —— 节点退化为单机模式，等 NATS 恢复后
-    /// 下一跳心跳会自动重连。这是「节点动态增减、无需重启整体服务」的前提。
+    /// 初始化：连接 NATS，注册自身，启动全部后台任务。
+    ///
+    /// 连接失败**不让进程退出**：节点退化为单机模式，同时在后台启一个
+    /// 带退避的重连循环（[`Cluster::nats_supervisor`]）。重连成功后自动补注册自身
+    /// 并发布一次快照，无需人工重启容器，这是“节点动态增减、无需重启
+    /// 整体服务”的前提。
+    ///
+    /// 「未连接」与「已连接但成员还没收齐」是两件事：前者看
+    /// `status.nats_connected`，后者看 `registry.nodes()`。探针两个都给出，
+    /// 否则节点 2/3 错过第一轮快照、迟迟看不到成员时，机器判据看不出来。
     pub async fn initialize(self: Arc<Self>) {
-        let bus = match NatsBus::connect(&self.cfg, DEFAULT_PUBLISHER_CAPACITY).await {
-            Ok(b) => b,
+        match self.connect_or_degrade().await {
+            Some(bus) => {
+                self.register_cluster_membership(bus).await;
+            }
+            None => {
+                // NATS 暂时不可用：继续以单机模式运行，重连交给 supervisor。
+                let self_arc = Arc::clone(&self);
+                tokio::spawn(async move {
+                    self_arc.nats_supervisor().await;
+                });
+            }
+        }
+    }
+
+    /// 连接 NATS。成功返回 bus；失败把节点标成「未连接」并返回 `None`。
+    ///
+    /// 启动期与重连期共用这一处：错误文本、状态位、日志格式都只有一份。
+    async fn connect_or_degrade(&self) -> Option<NatsBus> {
+        match NatsBus::connect(&self.cfg, DEFAULT_PUBLISHER_CAPACITY).await {
+            Ok(b) => {
+                info!(
+                    node = %self.cfg.node_id,
+                    cluster = %self.cfg.cluster_id,
+                    role = self.cfg.node_role.as_str(),
+                    advertised = %self.cfg.advertised_addr,
+                    "节点已加入集群，等待开始承接新会议"
+                );
+                Some(b)
+            }
             Err(e) => {
                 warn!(
                     error = %e,
                     server = %self.cfg.server,
                     port = self.cfg.port,
-                    "NATS 未连接，节点退化为单机模式（将在下一跳心跳重试）"
+                    "NATS 未连接，节点退化为单机模式（后台将带退避重试）"
                 );
                 self.bump_status(|s| s.nats_connected = false);
-                return;
+                None
             }
-        };
+        }
+    }
 
+    /// NATS 后台重连循环：带指数退避，成功后自动重新加入集群。
+    ///
+    /// 只在「启动时就没连上」的路径起这一个循环。连接建立之后由 async-nats
+    /// 自己处理 ping 与断线重连，业务层不重复实现一套。
+    ///
+    /// 间隔从 [`NATS_RECONNECT_MIN_SECS`] 翻倍，到 [`NATS_RECONNECT_MAX_SECS`] 封顶，
+    /// 成功后复位。NATS 短暂抖动不会触发密集重试，长期不可用也不会放弃：
+    /// 离线期间节点持续以单机模式运行，会议照常进行。
+    pub async fn nats_supervisor(self: Arc<Self>) {
+        let mut delay = Duration::from_secs(NATS_RECONNECT_MIN_SECS);
+        loop {
+            // 用 `sleep` 而不是 `interval`：退避时长由上一次结果决定，固定的 tick
+            // 节奏会把「NATS 刚恢复」与「刚又断了」混成同一个间隔。
+            tokio::time::sleep(delay).await;
+            match self.connect_or_degrade().await {
+                Some(bus) => {
+                    info!(
+                        node = %self.cfg.node_id,
+                        waited_secs = delay.as_secs(),
+                        "NATS 已恢复，节点重新加入集群"
+                    );
+                    self.register_cluster_membership(bus).await;
+                    return;
+                }
+                None => {
+                    warn!(
+                        node = %self.cfg.node_id,
+                        next_retry_in_secs = delay.as_secs(),
+                        "NATS 仍不可用，继续单机模式"
+                    );
+                    delay = (delay * 2).min(Duration::from_secs(NATS_RECONNECT_MAX_SECS));
+                }
+            }
+        }
+    }
+
+    /// 加入集群：注册自身、发一次自己归属的房间快照、启全部后台循环。
+    ///
+    /// 注册自身与启动循环必须成对发生：只注册不启动循环，节点会在下一轮健康检查
+    /// 被判死（心跳没发出）；只启动循环不注册，本节点不可被调度。
+    async fn register_cluster_membership(self: Arc<Self>, bus: NatsBus) {
+        let bus = Arc::new(bus);
         self.alive.store(true, Ordering::SeqCst);
         self.bump_status(|s| s.nats_connected = true);
-        info!(
-            node = %self.cfg.node_id,
-            cluster = %self.cfg.cluster_id,
-            role = %self.cfg.node_role.as_str(),
-            advertised = %self.cfg.advertised_addr,
-            "节点已加入集群，等待开始承接新会议"
-        );
-
+        // 先扫一遍离线期间失联的远端节点，把自己注册进去之前先记一笔账：
+        // 否则注册表里会同时躺着自己这一批 stale 节点，这一轮的调度决策会
+        // 被离线期间的残留数据污染。注意这里**只报告不判死**——把节点标记
+        // Dead、把房间迁移走仍是判死循环（reap_dead）的专职工作，那是
+        // `dead_nodes_detected` 与两阶段迁移接手的唯一入口。
+        let stale = self.reap_dead_remote();
+        if !stale.is_empty() {
+            info!(
+                node = %self.cfg.node_id,
+                stale = stale.join(","),
+                "重连后扫到失联节点，判死与房间迁移交给判死循环"
+            );
+        }
         // 注册自身到本地注册表：让本节点立即可调度自己的房间，
         // 不必等远端心跳来回确认。
         self.register_self();
-        let bus = Arc::new(bus);
-        self.broadcast_snapshot(&bus).await.ok();
+        // 加入集群时立刻发一次自己归属的房间，让其它节点马上看到本节点；
+        // 之后由 snapshot_publish_loop 每个心跳周期重发（新节点靠它追上全量状态）。
+        {
+            let (rooms, total) = self.owned_rooms_and_total();
+            let _ = bus.publish_snapshot(&rooms, total).await;
+        }
 
         // 每个后台循环各持一份 bus 克隆：`async move` 会捕获按值移动的 `Arc`，
         // 所以先把每份克隆绑定成局部变量再 spawn。
-        let (bus_hb, bus_hb_recv, bus_route, bus_mig, bus_snap) = (
+        let (bus_hb, bus_hb_recv, bus_route, bus_mig, bus_snap_pub, bus_snap_sub) = (
+            Arc::clone(&bus),
             Arc::clone(&bus),
             Arc::clone(&bus),
             Arc::clone(&bus),
@@ -197,9 +294,14 @@ impl Cluster {
             mig.migrate_loop(bus_mig).await;
         });
 
-        let snap = Arc::clone(&self);
+        let snap_pub = Arc::clone(&self);
         tokio::spawn(async move {
-            snap.snapshot_loop(bus_snap).await;
+            snap_pub.snapshot_publish_loop(bus_snap_pub).await;
+        });
+
+        let snap_sub = Arc::clone(&self);
+        tokio::spawn(async move {
+            snap_sub.snapshot_loop(bus_snap_sub).await;
         });
 
         let rooms_sub = Arc::clone(&self);
@@ -288,7 +390,7 @@ impl Cluster {
     pub fn assign_room(&self, room_id: &str) -> Option<String> {
         let reg = self.registry.lock();
         self.router
-            .assign(&reg, &self.cfg, room_id, DEFAULT_NEW_ROOM_STREAMS, 0)
+            .assign(&reg, room_id, DEFAULT_NEW_ROOM_STREAMS, 0)
     }
 
     // ── 房间管理 ──
@@ -298,16 +400,35 @@ impl Cluster {
         self.rooms.lock().values().cloned().collect()
     }
 
-    /// 广播本节点归属的房间快照。
-    pub async fn broadcast_snapshot(&self, bus: &NatsBus) -> QmResult<()> {
-        let rooms: Vec<RoomState> = self
-            .registry
-            .lock()
+    /// 快照发送循环：`initialize` 时先发一次，之后每 `heartbeat_secs` 重发一次。
+    ///
+    /// 周期重发（而不是只在启动时发一次）是为了让**新节点上线就能拿到快照**：
+    /// 它连上 NATS 之后订阅 `room.snapshot`，下一个心跳周期就会收到各节点发来的
+    /// 自己归属的房间 —— 这是「新节点 30 秒内接入并承接新会议」的实现路径，
+    /// 不依赖请求/回复那种要求对端先在线的交互。
+    ///
+    /// `total` 是**本节点房间视图的总数**，而不是 `rooms` 的长度：`rooms` 只含
+    /// 本节点归属的房间，`total` 是本节点看到的全集群房间数。`snapshot_loop` 拿
+    /// 它判断一份快照是否覆盖了整个集群，从而避免用部分快照冲掉自己已有的视图。
+    async fn snapshot_publish_loop(self: Arc<Self>, bus: Arc<NatsBus>) {
+        let interval = Duration::from_secs(self.cfg.heartbeat_secs.max(1));
+        loop {
+            let (rooms, total) = self.owned_rooms_and_total();
+            let _ = bus.publish_snapshot(&rooms, total).await;
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// 本节点归属的房间 + 本节点房间视图总数（在同一个锁作用域内取，避免中间态）。
+    fn owned_rooms_and_total(&self) -> (Vec<RoomState>, usize) {
+        let reg = self.registry.lock();
+        let total = reg.rooms().count();
+        let rooms = reg
             .rooms()
             .filter(|r| r.owner.as_deref() == Some(self.cfg.node_id.as_str()))
             .cloned()
             .collect();
-        bus.publish_snapshot(&rooms).await
+        (rooms, total)
     }
 
     /// 收到一条远端房间状态更新。
@@ -318,11 +439,17 @@ impl Cluster {
         }
     }
 
-    /// 收到一次房间快照（新节点上线时用）。
-    pub fn apply_remote_snapshot(&self, rooms: Vec<RoomState>) {
-        let total_rooms = rooms.len();
+    /// 收到一次房间快照（各节点的 `snapshot_publish_loop` 周期发布）。
+    ///
+    /// `payload.rooms` 只含发送方自己归属的房间，所以**逐房间按 `revision` 收敛**
+    /// 就够了 —— 快照是追加式的，不需要按 `total` 反推删除：房间结束走的是
+    /// `room.update` / `room.remove`，不是「不再出现在快照里」。`total` 只是
+    /// 发送方看到的全集群房间数，用于判断这份快照是否覆盖了整个集群（日志与
+    /// 后续的对账），不用于删除本节点已有的房间。
+    pub fn apply_remote_snapshot(&self, payload: SnapshotPayload) {
+        let total_rooms = payload.total;
         let mut local_changes = 0usize;
-        for room in rooms {
+        for room in payload.rooms {
             self.registry.lock().apply_room(room.clone());
             if room.owner.as_deref() == Some(self.cfg.node_id.as_str()) {
                 self.rooms.lock().insert(room.id.clone(), room);
@@ -419,6 +546,9 @@ impl Cluster {
     }
 
     /// 当前状态快照（用于 healthz）。
+    ///
+    /// `nats_connected` 是探针状态码的唯一依据：NATS 未连接时 `GET /healthz`
+    /// 返回 503，否则集群退化成单机也会被判成 healthy。
     pub fn status_snapshot(&self) -> ClusterStatus {
         let mut s = self.status.lock().clone();
         let reg = self.registry.lock();
@@ -428,6 +558,14 @@ impl Cluster {
         s.total_listeners = reg.total_listeners();
         s.heartbeat_seq = self.hb_seq.load(Ordering::SeqCst);
         s
+    }
+
+    /// 供测试与探针自测用：直接把 NATS 状态位打到指定值，不碰任何连接。
+    ///
+    /// 探针的状态码只来自 [`ClusterStatus::nats_connected`]，测这个映射不能
+    /// 依赖一台真的 NATS server。
+    pub fn mark_nats_connected(&self, connected: bool) {
+        self.bump_status(|s| s.nats_connected = connected);
     }
 
     /// 配置。
@@ -446,15 +584,31 @@ impl Cluster {
             last_seq: self.hb_seq.fetch_add(1, Ordering::SeqCst) + 1,
             status: NodeStatus::Live,
             max_rooms: self.cfg.max_rooms_per_node as u64,
+            listener_capacity: self.cfg.listener_capacity as u64,
+            listener_fanout: self.cfg.listener_fanout as u64,
             dead_since_ms: None,
         };
         let _ = self.registry.lock().insert_node(node);
     }
 
+    /// 重连后专用：只读扫一遍失联的远端节点，返回它们的 node_id。
+    ///
+    /// **只报告、不判死**：标记 `NodeStatus::Dead`、触发房间迁移、递增
+    /// `dead_nodes_detected` 都是 [`Cluster::health_check`] / `reap_dead` 的专职
+    /// 工作（迁移计数器与两段式交接的唯一入口）。这里不碰状态，避免重连路径
+    /// 和判死循环同时驱动迁移。
+    ///
+    /// [`Cluster::health_check`] 一次只能全做或全不做，而重连成功那一刻只想先
+    /// 知道「离线期间谁失联了」再把自己登记进注册表：否则这一轮的调度候选里
+    /// 会混着离线期的 stale 条目。真正的不可达节点由下一轮健康检查收敛。
+    fn reap_dead_remote(&self) -> Vec<String> {
+        self.registry.lock().reap_dead_remote(&self.cfg, unix_ms())
+    }
+
     fn migration_destination(&self, exclude: &str, streams: u64, listeners: u64) -> Option<String> {
         let reg = self.registry.lock();
         self.router
-            .migration_destination(&reg, &self.cfg, Some(exclude), streams, listeners)
+            .migration_destination(&reg, Some(exclude), streams, listeners)
     }
 
     fn bump_status<F: FnOnce(&mut ClusterStatus)>(&self, f: F) {
@@ -616,7 +770,7 @@ impl Cluster {
             let decision = {
                 let reg = self.registry.lock();
                 self.router
-                    .assign(&reg, &self.cfg, &req.room_id, req.streams, req.listeners)
+                    .assign(&reg, &req.room_id, req.streams, req.listeners)
             };
             // 队列订阅只会被队列里的一个节点消费，所以回包不会重复。
             // 无可用目标时回一个空串，请求方据此区分「调度失败」与「超时」。
@@ -638,7 +792,8 @@ impl Cluster {
 
     /// 队列订阅迁移请求：目标节点处理并回包。
     async fn migrate_loop(self: Arc<Self>, bus: Arc<NatsBus>) {
-        // 只订阅「投给本节点」的迁移请求；队列名按 node_id 分片，避免与路由队列串台。
+        // 只订阅「投给本节点」的迁移请求：subject 本身按目标 node_id 分片，
+        // 所以这里不靠队列分摊，用队列名只为与路由队列区分。
         let subject = bus.subjects().migrate_for_self.clone();
         let Some(mut sub) = bus.queue_subscribe(&subject, "migrate").await.ok() else {
             warn!("无法订阅迁移 subject，故障迁移将不会发生");
@@ -653,7 +808,7 @@ impl Cluster {
         }
     }
 
-    /// 订阅房间全量快照。
+    /// 订阅房间全量快照（发送方是各节点的 `snapshot_publish_loop`）。
     async fn snapshot_loop(self: Arc<Self>, bus: Arc<NatsBus>) {
         let subject = bus.subjects().room_snapshot.clone();
         let Some(mut sub) = bus.subscribe(&subject).await.ok() else {
@@ -661,9 +816,11 @@ impl Cluster {
             return;
         };
         while let Some(msg) = sub.next().await {
-            if let Some(rooms) = decode::<Vec<RoomState>>(&msg.payload) {
-                self.apply_remote_snapshot(rooms);
-            }
+            let Some(payload) = decode::<SnapshotPayload>(&msg.payload) else {
+                warn!("收到无法解析的房间快照，已忽略");
+                continue;
+            };
+            self.apply_remote_snapshot(payload);
         }
     }
 
@@ -707,8 +864,7 @@ impl Cluster {
 
         let can_accept = {
             let reg = self.registry.lock();
-            self.router
-                .can_accept(&reg, &self.cfg, req.streams, req.listeners)
+            self.router.can_accept(&reg, req.streams, req.listeners)
         };
         if !can_accept {
             self.publish_reject(bus, msg.clone(), req, "本节点无承接余量")
@@ -776,7 +932,7 @@ mod tests {
     use super::*;
     use qm_common::ClusterConfig;
 
-    fn cfg(node: &str) -> ClusterConfig {
+    fn tcfg(node: &str) -> ClusterConfig {
         ClusterConfig {
             node_id: node.to_string(),
             advertised_addr: "192.168.0.10:8080".to_string(),
@@ -794,13 +950,13 @@ mod tests {
 
     #[test]
     fn assign_returns_none_when_no_candidates() {
-        let cluster = Cluster::new(cfg("n1"));
+        let cluster = Cluster::new(tcfg("n1"));
         assert!(cluster.assign_room("room-1").is_none());
     }
 
     #[test]
     fn apply_remote_room_updates_registry_only_when_owned() {
-        let cluster = Cluster::new(cfg("n1"));
+        let cluster = Cluster::new(tcfg("n1"));
         // 不属于自己的房间：只进 registry 视图，不进本地 rooms map。
         let room = RoomState::new("r1", 1, 3).with_owner(
             Some("n2".to_string()),
@@ -814,7 +970,7 @@ mod tests {
 
     #[test]
     fn apply_remote_room_inserts_owned_room() {
-        let cluster = Cluster::new(cfg("n1"));
+        let cluster = Cluster::new(tcfg("n1"));
         let room = RoomState::new("r1", 1, 3).with_owner(
             Some("n1".to_string()),
             "192.168.0.10:8080",
@@ -827,7 +983,7 @@ mod tests {
 
     #[test]
     fn status_snapshot_defaults() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         let s = c.status_snapshot();
         assert_eq!(s.node_id, "n1");
         assert_eq!(s.cluster_id, "quickmeet");
@@ -838,7 +994,7 @@ mod tests {
 
     #[test]
     fn register_self_makes_node_schedulable() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         c.register_self();
         // 自身节点健康，因此可以作为调度目标
         assert!(c.is_node_healthy("n1"));
@@ -847,7 +1003,7 @@ mod tests {
 
     #[test]
     fn total_listeners_aggregates_registry() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         c.apply_remote_room(RoomState::new("r1", 1, 10));
         c.apply_remote_room(RoomState::new("r2", 1, 20));
         assert_eq!(c.total_listeners(), 30);
@@ -856,7 +1012,7 @@ mod tests {
 
     #[test]
     fn migration_destination_excludes_dead_node() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         c.register_self();
         // 只有一个候选（自身），排除后没有目标
         let dest = c.migration_destination("n1", 1, 0);
@@ -865,8 +1021,53 @@ mod tests {
 
     #[tokio::test]
     async fn remove_room_returns_false_when_absent() {
-        let c = Cluster::new(cfg("n1"));
+        let c = Cluster::new(tcfg("n1"));
         // 无 NATS bus 时只验证本地行为：房间不存在时不改任何状态。
         assert!(c.rooms_snapshot().is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_merges_owned_and_foreign_rooms() {
+        // `rooms` 只含发送方归属的房间，`total` 是发送方看到的全集群房间数 ——
+        // 两者含义不同，所以本地房间数应由 rooms 决定，不能拿 total 去删已有房间。
+        let c = Cluster::new(tcfg("n1"));
+        let foreign = RoomState::new("r-f", 1, 5).with_owner(
+            Some("n2".to_string()),
+            "192.168.0.11:8080",
+            NodeRole::Full,
+        );
+        let own = RoomState::new("r-o", 1, 2).with_owner(
+            Some("n1".to_string()),
+            "192.168.0.10:8080",
+            NodeRole::Full,
+        );
+        c.apply_remote_snapshot(SnapshotPayload {
+            total: 5,
+            rooms: vec![foreign, own],
+        });
+        assert_eq!(c.room_count(), 2, "视图里应有两个房间");
+        assert_eq!(c.rooms_snapshot().len(), 1, "只有本节点归属的进本地 map");
+        assert_eq!(c.rooms_snapshot()[0].id, "r-o");
+        assert!(c.registry.lock().room("r-f").is_some());
+        assert_eq!(c.total_listeners(), 7);
+    }
+
+    #[test]
+    fn listener_count_update_keeps_ownership() {
+        // add_listener / remove_listener 走的是 `with_counts`：只改计数，
+        // owner 必须保持，否则整个集群会把房间当成未归属的 pending 房间，
+        // Router::assign 跳过它、故障迁移也找不到它。
+        let c = Cluster::new(tcfg("n1"));
+        let room = RoomState::new("r1", 1, 3).with_owner(
+            Some("n2".to_string()),
+            "192.168.0.11:8080",
+            NodeRole::Full,
+        );
+        c.apply_remote_room(room.clone());
+        c.apply_remote_room(room.with_counts(1, 4));
+        let reg = c.registry.lock();
+        let cur = reg.room("r1").expect("房间仍在");
+        assert_eq!(cur.owner.as_deref(), Some("n2"), "加旁听后归属不能丢");
+        assert!(cur.is_owned());
     }
 }
